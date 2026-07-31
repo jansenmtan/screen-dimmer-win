@@ -8,3 +8,7 @@ wheels/
 
 # Virtual environments
 .venv
+
+# User data / logs (machine-specific, not source)
+settings.json
+gamma_watchdog.log

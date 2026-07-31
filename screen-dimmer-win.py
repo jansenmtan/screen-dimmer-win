@@ -3,7 +3,7 @@ import json
 import math
 import os
 import urllib.request
-from datetime import datetime
+from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 
 import tkinter as tk
@@ -62,6 +62,18 @@ class DEVMODE(ctypes.Structure):
 ENUM_CURRENT_SETTINGS = -1
 
 hdc = ctypes.windll.user32.GetDC(0)
+
+# Settings are persisted next to this script
+SETTINGS_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "settings.json")
+
+DEFAULT_SETTINGS = {
+    "zip_code": "",
+    "location": None,        # {"lat": float, "lon": float, "name": str, "tz": str}
+    "auto_enabled": False,
+    "night_brightness": 30,
+}
+
+TRANSITION_MINUTES = 30  # fade length around sunrise/sunset
 
 # The last ramp WE wrote. The hardware LUT is global, volatile state: games,
 # the OS, and display mode changes can overwrite it at any time with no
@@ -205,25 +217,58 @@ def get_location_from_zip(zip_code):
     except Exception:
         return None
 
+def fmt_time(dt):
+    """Formats a datetime like '7:15 AM' (Windows-safe, no %-I flag)."""
+    return dt.strftime('%I:%M %p').lstrip('0')
+
+def blend(now, start, end, from_val, to_val):
+    """Linear interpolation of a value as `now` moves from start to end."""
+    total = (end - start).total_seconds()
+    if total <= 0:
+        return to_val
+    f = max(0.0, min(1.0, (now - start).total_seconds() / total))
+    return from_val + (to_val - from_val) * f
+
 # --- 4. GUI APPLICATION ---
 class SunsetApp(tk.Tk):
     def __init__(self):
         super().__init__()
         self.title("Custom Sunset Screen")
-        self.geometry("400x500")
+        self.geometry("400x640")
         self.resizable(False, False)
 
         # Prevent screen from staying tinted if the app is closed
         self.protocol("WM_DELETE_WINDOW", self.on_close)
 
-        self.lat = None
-        self.lon = None
+        # Load saved preferences (zip code, location, auto-brightness)
+        self.settings = self.load_settings()
+        loc = self.settings.get("location") or {}
+        self.lat = loc.get("lat")
+        self.lon = loc.get("lon")
+        self.loc_name = loc.get("name")
+        self.tz = None
+        if loc.get("tz"):
+            try:
+                self.tz = ZoneInfo(loc["tz"])
+            except Exception:
+                self.tz = None
+        self.auto_brightness = 1.0
 
         self._watchdog_job = None
         self.last_mode = get_display_mode()
         log_event(f"App started. Display mode: {fmt_mode(self.last_mode)}")
 
         self.create_widgets()
+
+        # Restore saved location, if any
+        if self.lat is not None and self.lon is not None and self.loc_name:
+            self.loc_label.config(text=f"Location: {self.loc_name}", fg="black")
+            self.calculate_sunset()
+
+        # Apply saved auto-brightness state and start the periodic timer
+        self.apply_auto_state()
+        self.after(60_000, self.auto_tick)
+
         self.start_watchdog()
 
     def create_widgets(self):
@@ -234,6 +279,9 @@ class SunsetApp(tk.Tk):
         tk.Label(loc_frame, text="Zip Code:").grid(row=0, column=0, sticky="w")
         self.zip_entry = tk.Entry(loc_frame, width=10)
         self.zip_entry.grid(row=0, column=1, padx=5)
+        saved_zip = self.settings.get("zip_code", "")
+        if saved_zip:
+            self.zip_entry.insert(0, saved_zip)
 
         tk.Button(loc_frame, text="Set Location", command=self.fetch_location).grid(row=0, column=2, padx=5)
 
@@ -284,6 +332,23 @@ class SunsetApp(tk.Tk):
         self.b_slider.set(100)
         self.b_slider.pack(fill="x")
 
+        # --- Auto Brightness Frame ---
+        auto_frame = tk.LabelFrame(self, text="Auto Brightness", padx=10, pady=10)
+        auto_frame.pack(padx=10, pady=5, fill="x")
+
+        self.auto_var = tk.BooleanVar(value=bool(self.settings.get("auto_enabled", False)))
+        tk.Checkbutton(auto_frame, text="Auto-adjust by time of day",
+                       variable=self.auto_var, command=self.toggle_auto).pack(anchor="w")
+
+        tk.Label(auto_frame, text="Night Brightness (%)").pack(anchor="w", pady=(5, 0))
+        self.night_slider = tk.Scale(auto_frame, from_=5, to=100, orient="horizontal",
+                                     command=lambda e: self.on_night_change())
+        self.night_slider.set(int(self.settings.get("night_brightness", 30)))
+        self.night_slider.pack(fill="x")
+
+        self.auto_status = tk.Label(auto_frame, text="Off", fg="gray")
+        self.auto_status.pack(anchor="w", pady=(5, 0))
+
         # --- Reset Button ---
         tk.Button(self, text="Reset to Normal (Daylight)", bg="lightgray", command=self.reset_screen).pack(pady=10)
 
@@ -298,8 +363,41 @@ class SunsetApp(tk.Tk):
             self.rgb_frame.pack(padx=10, pady=5, fill="both", expand=True)
         self.update_screen()
 
+    def load_settings(self):
+        try:
+            with open(SETTINGS_FILE, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            if not isinstance(data, dict):
+                raise ValueError
+        except Exception:
+            data = {}
+        merged = dict(DEFAULT_SETTINGS)
+        merged.update(data)
+        return merged
+
+    def save_settings(self):
+        loc = None
+        if self.lat is not None and self.lon is not None:
+            loc = {
+                "lat": self.lat,
+                "lon": self.lon,
+                "name": self.loc_name,
+                "tz": self.tz.key if self.tz else None,
+            }
+        self.settings.update({
+            "zip_code": self.zip_entry.get().strip(),
+            "location": loc,
+            "auto_enabled": bool(self.auto_var.get()),
+            "night_brightness": self.night_slider.get(),
+        })
+        try:
+            with open(SETTINGS_FILE, "w", encoding="utf-8") as f:
+                json.dump(self.settings, f, indent=2)
+        except Exception:
+            pass  # never crash the app over a settings write
+
     def fetch_location(self):
-        zip_code = self.zip_entry.get()
+        zip_code = self.zip_entry.get().strip()
         if not zip_code.isdigit() or len(zip_code) != 5:
             self.loc_label.config(text="Invalid Zip Code", fg="red")
             return
@@ -307,28 +405,111 @@ class SunsetApp(tk.Tk):
         result = get_location_from_zip(zip_code)
         if result:
             self.lat, self.lon, name = result
+            self.loc_name = name
             self.loc_label.config(text=f"Location: {name}", fg="black")
+            try:
+                tz_str = TimezoneFinder().timezone_at(lat=self.lat, lng=self.lon)
+                self.tz = ZoneInfo(tz_str) if tz_str else None
+            except Exception:
+                self.tz = None
+            self.save_settings()
             self.calculate_sunset()
+            if self.auto_var.get():
+                self.run_auto_now()  # location may change the auto schedule
         else:
             self.loc_label.config(text="Zip Code not found", fg="red")
 
     def calculate_sunset(self):
-        if not self.lat or not self.lon:
+        if self.lat is None or self.lon is None:
             return
 
-        # Find the timezone for these coordinates
-        tf = TimezoneFinder()
-        tz_str = tf.timezone_at(lat=self.lat, lng=self.lon)
-        tz = ZoneInfo(tz_str)
-
-        # Get current local time at that location
+        tz = self.tz or datetime.now().astimezone().tzinfo
         now_local = datetime.now(tz)
 
         # Calculate sun events using Astral
-        s = sun(Observer(self.lat, self.lon), date=now_local.date(), tzinfo=tz)
-        sunset_time = s['sunset'].strftime('%I:%M %p')
+        try:
+            s = sun(Observer(self.lat, self.lon), date=now_local.date(), tzinfo=tz)
+            sunrise_time = fmt_time(s['sunrise'])
+            sunset_time = fmt_time(s['sunset'])
+            self.sunset_label.config(
+                text=f"Sunrise: {sunrise_time}   Sunset: {sunset_time}", fg="black")
+        except Exception:
+            self.sunset_label.config(
+                text="Sun times unavailable for this date/location", fg="red")
 
-        self.sunset_label.config(text=f"Local Sunset Today: {sunset_time}", fg="black")
+    # --- Auto Brightness ---
+    def toggle_auto(self):
+        self.save_settings()
+        self.apply_auto_state()
+
+    def apply_auto_state(self):
+        """Enable/disable manual brightness control based on the auto checkbox."""
+        if self.auto_var.get():
+            self.bright_slider.config(state="disabled")
+            self.run_auto_now()
+        else:
+            self.bright_slider.config(state="normal")
+            self.auto_brightness = 1.0
+            self.auto_status.config(text="Off", fg="gray")
+            self.update_screen()
+
+    def on_night_change(self):
+        self.save_settings()
+        if self.auto_var.get():
+            self.run_auto_now()
+
+    def auto_tick(self):
+        """Periodic timer: refresh auto brightness, then reschedule."""
+        if self.auto_var.get():
+            self.run_auto_now()
+        self.after(60_000, self.auto_tick)
+
+    def run_auto_now(self):
+        brightness, status = self.compute_auto_brightness()
+        self.auto_brightness = brightness
+        self.auto_status.config(text=status, fg="black")
+        self.update_screen()
+
+    def compute_auto_brightness(self):
+        """Returns (brightness 0.05-1.0, status text) based on the time of day."""
+        day = 1.0
+        night = self.night_slider.get() / 100.0
+        trans = timedelta(minutes=TRANSITION_MINUTES)
+        source = ""
+
+        sunrise = sunset = None
+        if self.lat is not None and self.lon is not None:
+            tz = self.tz or datetime.now().astimezone().tzinfo
+            now = datetime.now(tz)
+            try:
+                s = sun(Observer(self.lat, self.lon), date=now.date(), tzinfo=tz)
+                sunrise, sunset = s['sunrise'], s['sunset']
+            except Exception:
+                source = " (fixed schedule)"
+        else:
+            tz = datetime.now().astimezone().tzinfo
+            now = datetime.now(tz)
+            source = " (fixed schedule)"
+
+        if sunrise is None:
+            # Fallback: fixed 7:00-19:00 day with 1-hour fades, local time
+            sunrise = now.replace(hour=7, minute=0, second=0, microsecond=0)
+            sunset = now.replace(hour=19, minute=0, second=0, microsecond=0)
+            trans = timedelta(minutes=60)
+
+        if now < sunrise:
+            b, phase = night, f"Night - sunrise {fmt_time(sunrise)}"
+        elif now < sunrise + trans:
+            b, phase = blend(now, sunrise, sunrise + trans, night, day), "Sunrise fade-in"
+        elif now < sunset - trans:
+            b, phase = day, f"Day - sunset {fmt_time(sunset)}"
+        elif now < sunset:
+            b, phase = blend(now, sunset - trans, sunset, day, night), "Sunset fade-out"
+        else:
+            b, phase = night, "Night - sunrise tomorrow"
+
+        status = f"{phase} | Brightness {int(round(b * 100))}%{source}"
+        return max(0.05, min(1.0, b)), status
 
     def update_screen(self):
         mode = self.mode_var.get()
@@ -336,8 +517,11 @@ class SunsetApp(tk.Tk):
         if mode == "temp":
             # Convert Kelvin to RGB
             r_mult, g_mult, b_mult = kelvin_to_rgb(self.temp_slider.get())
-            # Get brightness (slider is 5-100, convert to 0.05 - 1.0)
-            brightness = self.bright_slider.get() / 100.0
+            # Auto mode overrides the brightness slider (5-100 -> 0.05 - 1.0)
+            if self.auto_var.get():
+                brightness = self.auto_brightness
+            else:
+                brightness = self.bright_slider.get() / 100.0
 
             apply_gamma(r_mult, g_mult, b_mult, brightness)
         else:
@@ -345,8 +529,9 @@ class SunsetApp(tk.Tk):
             r_mult = self.r_slider.get() / 100.0
             g_mult = self.g_slider.get() / 100.0
             b_mult = self.b_slider.get() / 100.0
-            # In RGB mode, brightness is implicit to the sliders
-            apply_gamma(r_mult, g_mult, b_mult, brightness=1.0)
+            # In RGB mode, auto brightness applies as a multiplier if enabled
+            brightness = self.auto_brightness if self.auto_var.get() else 1.0
+            apply_gamma(r_mult, g_mult, b_mult, brightness)
 
     # --- Gamma watchdog: detect & repair external resets/overwrites ---
     def start_watchdog(self):
@@ -409,7 +594,8 @@ class SunsetApp(tk.Tk):
                 pass
             self._watchdog_job = None
         log_event("App closing; ramp reset to normal.")
-        # Critical: Reset screen to normal before closing
+        # Persist preferences, then reset screen to normal before closing
+        self.save_settings()
         apply_gamma(1.0, 1.0, 1.0, 1.0)
         ctypes.windll.user32.ReleaseDC(0, hdc)
         self.destroy()
