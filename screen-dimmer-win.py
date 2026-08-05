@@ -71,6 +71,8 @@ DEFAULT_SETTINGS = {
     "location": None,        # {"lat": float, "lon": float, "name": str, "tz": str}
     "auto_enabled": False,
     "night_brightness": 30,
+    "auto_mode": "sun",     # "sun" = follow sunrise/sunset, "curve" = custom 24h curve
+    "auto_curve": None,      # [[hour, brightness%], ...] for custom curve mode
 }
 
 TRANSITION_MINUTES = 30  # fade length around sunrise/sunset
@@ -229,12 +231,217 @@ def blend(now, start, end, from_val, to_val):
     f = max(0.0, min(1.0, (now - start).total_seconds() / total))
     return from_val + (to_val - from_val) * f
 
+def default_curve(night_pct):
+    """Seed curve: night level with 30-min fades around 7:00 AM / 7:00 PM."""
+    n = float(night_pct)
+    return [[0.0, n], [6.5, n], [7.0, 100.0], [18.5, 100.0], [19.0, n], [24.0, n]]
+
+def eval_curve(points, hour):
+    """Brightness (0-100) at `hour` (0-24) on a piecewise-linear 24h curve.
+
+    The curve is periodic: the segment after the last point wraps around to
+    the first point (e.g. 22:00 -> 06:00 with no point at midnight)."""
+    if not points:
+        return 100.0
+    pts = sorted(points, key=lambda p: p[0])
+    if len(pts) == 1:
+        return pts[0][1]
+    hour = hour % 24.0
+    first, last = pts[0], pts[-1]
+    if hour < first[0] or hour >= last[0]:
+        # wrap-around segment: last point -> first point (next day)
+        span = first[0] + 24.0 - last[0]
+        if hour >= last[0]:
+            t = (hour - last[0]) / span
+        else:
+            t = (hour + 24.0 - last[0]) / span
+        return last[1] + (first[1] - last[1]) * t
+    for (h0, b0), (h1, b1) in zip(pts, pts[1:]):
+        if h0 <= hour < h1:
+            f = (hour - h0) / (h1 - h0)
+            return b0 + (b1 - b0) * f
+    return pts[-1][1]
+
+class CurveEditor(tk.Toplevel):
+    """Edit the 24-hour brightness curve.
+
+    Drag points to move them, click empty space to add a point, right-click a
+    point to delete it. Brightness is interpolated linearly between points.
+    """
+
+    CW, CH = 620, 300
+    PAD_L, PAD_R, PAD_T, PAD_B = 50, 14, 12, 34
+    MIN_POINTS = 1
+    MAX_POINTS = 48
+
+    def __init__(self, parent, points, night_pct, on_done):
+        super().__init__(parent)
+        self.title("Auto Brightness Curve \u2014 24h schedule")
+        self.resizable(False, False)
+        self.transient(parent)
+        self.grab_set()
+
+        self.night_pct = night_pct
+        self.points = [[float(h), float(b)] for h, b in points] or default_curve(night_pct)
+        self.on_done = on_done
+        self.selected = None
+        self._clock_job = None
+
+        self.canvas = tk.Canvas(self, width=self.CW, height=self.CH, bg="white",
+                                highlightthickness=1, highlightbackground="#999")
+        self.canvas.pack(padx=10, pady=(10, 2))
+
+        self.status = tk.Label(self, text="", fg="#333")
+        self.status.pack(anchor="w", padx=12)
+
+        tk.Label(self, text="Drag points to move \u00b7 click empty space to add \u00b7 right-click a point to delete",
+                 fg="gray").pack(anchor="w", padx=12)
+
+        btns = tk.Frame(self)
+        btns.pack(pady=8)
+        tk.Button(btns, text="Reset to Default", command=self.reset_points).pack(side="left", padx=6)
+        tk.Button(btns, text="Cancel", command=self.destroy).pack(side="left", padx=6)
+        tk.Button(btns, text="Done", command=self.done).pack(side="left", padx=6)
+
+        self.canvas.bind("<Button-1>", self.on_press)
+        self.canvas.bind("<B1-Motion>", self.on_drag)
+        self.canvas.bind("<ButtonRelease-1>", self.on_release)
+        self.canvas.bind("<Button-3>", self.on_right_click)
+        self.protocol("WM_DELETE_WINDOW", self.destroy)
+
+        self.draw()
+        self._clock_job = self.after(60_000, self._clock_tick)
+
+    def _clock_tick(self):
+        self.draw()
+        self._clock_job = self.after(60_000, self._clock_tick)
+
+    def destroy(self):
+        if self._clock_job is not None:
+            try:
+                self.after_cancel(self._clock_job)
+            except Exception:
+                pass
+            self._clock_job = None
+        super().destroy()
+
+    # --- geometry ---
+    def x_at(self, hour):
+        return self.PAD_L + hour / 24.0 * (self.CW - self.PAD_L - self.PAD_R)
+
+    def hour_at(self, x):
+        return max(0.0, min(24.0, (x - self.PAD_L) / (self.CW - self.PAD_L - self.PAD_R) * 24.0))
+
+    def y_at(self, bright):
+        return self.PAD_T + (1.0 - bright / 100.0) * (self.CH - self.PAD_T - self.PAD_B)
+
+    def bright_at(self, y):
+        return max(0.0, min(100.0, (1.0 - (y - self.PAD_T) / (self.CH - self.PAD_T - self.PAD_B)) * 100.0))
+
+    def draw(self):
+        c = self.canvas
+        c.delete("all")
+
+        # grid: hours every 2h, brightness every 25%
+        for h in range(0, 25, 2):
+            x = self.x_at(h)
+            c.create_line(x, self.PAD_T, x, self.CH - self.PAD_B, fill="#e8e8e8")
+            c.create_text(x, self.CH - self.PAD_B + 9, text=str(h), fill="#888", font=("Segoe UI", 8))
+        for b in range(0, 101, 25):
+            y = self.y_at(b)
+            c.create_line(self.PAD_L, y, self.CW - self.PAD_R, y, fill="#e8e8e8")
+            c.create_text(self.PAD_L - 6, y, text=str(b), anchor="e", fill="#888", font=("Segoe UI", 8))
+
+        # polyline, wrapping from the last point to the first point (next day)
+        pts = sorted(self.points, key=lambda p: p[0])
+        if pts:
+            poly = [(self.x_at(h), self.y_at(b)) for h, b in pts]
+            poly.append((self.x_at(pts[0][0] + 24.0), self.y_at(pts[0][1])))
+            c.create_line(poly, fill="#1a6fd0", width=2)
+
+        for h, b in pts:
+            c.create_oval(self.x_at(h) - 5, self.y_at(b) - 5,
+                          self.x_at(h) + 5, self.y_at(b) + 5,
+                          fill="#ff5555", outline="#222", width=1)
+
+        # current-time marker
+        now = datetime.now()
+        hour = now.hour + now.minute / 60.0
+        bx = eval_curve(pts, hour) if pts else 100.0
+        x = self.x_at(hour)
+        c.create_line(x, self.PAD_T, x, self.CH - self.PAD_B, fill="#d00", dash=(3, 3))
+        c.create_oval(x - 4, self.y_at(bx) - 4, x + 4, self.y_at(bx) + 4, fill="#d00", outline="")
+        self.status.config(text=f"Now: {fmt_time(now)} \u2192 brightness {round(bx)}%")
+
+    # --- mouse handling ---
+    def _hit(self, event):
+        """Index of the point within 8px of the click, or None."""
+        best, best_d = None, 8.0
+        for i, (h, b) in enumerate(self.points):
+            dx = self.x_at(h) - event.x
+            dy = self.y_at(b) - event.y
+            d = (dx * dx + dy * dy) ** 0.5
+            if d <= best_d:
+                best, best_d = i, d
+        return best
+
+    def on_press(self, event):
+        i = self._hit(event)
+        if i is not None:
+            self.selected = i
+            return
+        if len(self.points) >= self.MAX_POINTS:
+            return
+        x0, x1 = self.PAD_L, self.CW - self.PAD_R
+        y0, y1 = self.PAD_T, self.CH - self.PAD_B
+        if not (x0 <= event.x <= x1 and y0 <= event.y <= y1):
+            return
+        h = max(0.0, min(24.0, round(self.hour_at(event.x) * 12) / 12.0))  # 5-min snap
+        b = round(self.bright_at(event.y))
+        for j, (eh, _) in enumerate(self.points):
+            if abs(eh - h) < 1 / 60:
+                self.selected = j  # already a point here; select it instead
+                return
+        self.points.append([h, b])
+        self.selected = len(self.points) - 1
+        self.draw()
+
+    def on_drag(self, event):
+        if self.selected is None:
+            return
+        i = self.selected
+        h = max(0.0, min(24.0, round(self.hour_at(event.x) * 12) / 12.0))
+        b = max(0.0, min(100.0, round(self.bright_at(event.y))))
+        pts = sorted(self.points, key=lambda p: p[0])
+        j = pts.index(self.points[i])
+        lo = (pts[j - 1][0] + 1 / 60) if j > 0 else 0.0
+        hi = (pts[j + 1][0] - 1 / 60) if j < len(pts) - 1 else 24.0
+        self.points[i] = [max(lo, min(hi, h)), b]
+        self.draw()
+
+    def on_release(self, event):
+        self.selected = None
+
+    def on_right_click(self, event):
+        i = self._hit(event)
+        if i is not None and len(self.points) > self.MIN_POINTS:
+            del self.points[i]
+            self.draw()
+
+    def reset_points(self):
+        self.points = default_curve(self.night_pct)
+        self.draw()
+
+    def done(self):
+        self.on_done(sorted(self.points, key=lambda p: p[0]))
+        self.destroy()
+
 # --- 4. GUI APPLICATION ---
 class SunsetApp(tk.Tk):
     def __init__(self):
         super().__init__()
         self.title("Custom Sunset Screen")
-        self.geometry("400x640")
+        self.geometry("400x720")
         self.resizable(False, False)
 
         # Prevent screen from staying tinted if the app is closed
@@ -340,6 +547,17 @@ class SunsetApp(tk.Tk):
         tk.Checkbutton(auto_frame, text="Auto-adjust by time of day",
                        variable=self.auto_var, command=self.toggle_auto).pack(anchor="w")
 
+        self.auto_mode_var = tk.StringVar(value=self.settings.get("auto_mode", "sun"))
+        mode_row = tk.Frame(auto_frame)
+        mode_row.pack(anchor="w", pady=(5, 0))
+        tk.Radiobutton(mode_row, text="Follow sunrise/sunset", variable=self.auto_mode_var,
+                       value="sun", command=self.on_auto_mode_change).pack(side="left")
+        tk.Radiobutton(mode_row, text="Custom curve", variable=self.auto_mode_var,
+                       value="curve", command=self.on_auto_mode_change).pack(side="left", padx=(10, 0))
+
+        self.curve_btn = tk.Button(auto_frame, text="Edit Curve\u2026", command=self.open_curve_editor)
+        self.curve_btn.pack(anchor="w", pady=(5, 0))
+
         tk.Label(auto_frame, text="Night Brightness (%)").pack(anchor="w", pady=(5, 0))
         self.night_slider = tk.Scale(auto_frame, from_=5, to=100, orient="horizontal",
                                      command=lambda e: self.on_night_change())
@@ -348,6 +566,8 @@ class SunsetApp(tk.Tk):
 
         self.auto_status = tk.Label(auto_frame, text="Off", fg="gray")
         self.auto_status.pack(anchor="w", pady=(5, 0))
+
+        self.on_auto_mode_change()
 
         # --- Reset Button ---
         tk.Button(self, text="Reset to Normal (Daylight)", bg="lightgray", command=self.reset_screen).pack(pady=10)
@@ -389,6 +609,8 @@ class SunsetApp(tk.Tk):
             "location": loc,
             "auto_enabled": bool(self.auto_var.get()),
             "night_brightness": self.night_slider.get(),
+            "auto_mode": self.auto_mode_var.get(),
+            "auto_curve": self.settings.get("auto_curve"),
         })
         try:
             with open(SETTINGS_FILE, "w", encoding="utf-8") as f:
@@ -442,6 +664,30 @@ class SunsetApp(tk.Tk):
         self.save_settings()
         self.apply_auto_state()
 
+    def on_auto_mode_change(self):
+        """Switch between sun-synced and custom-curve schedules."""
+        if self.auto_mode_var.get() == "curve":
+            if not self.settings.get("auto_curve"):
+                self.settings["auto_curve"] = default_curve(self.night_slider.get())
+            self.night_slider.config(state="disabled")
+            self.curve_btn.config(state="normal")
+        else:
+            self.night_slider.config(state="normal")
+            self.curve_btn.config(state="disabled")
+        self.save_settings()
+        if self.auto_var.get():
+            self.run_auto_now()
+
+    def open_curve_editor(self):
+        pts = self.settings.get("auto_curve") or default_curve(self.night_slider.get())
+        CurveEditor(self, pts, self.night_slider.get(), self.on_curve_edited)
+
+    def on_curve_edited(self, points):
+        self.settings["auto_curve"] = points
+        self.save_settings()
+        if self.auto_var.get():
+            self.run_auto_now()
+
     def apply_auto_state(self):
         """Enable/disable manual brightness control based on the auto checkbox."""
         if self.auto_var.get():
@@ -472,6 +718,17 @@ class SunsetApp(tk.Tk):
 
     def compute_auto_brightness(self):
         """Returns (brightness 0.05-1.0, status text) based on the time of day."""
+        if self.auto_mode_var.get() == "curve":
+            pts = self.settings.get("auto_curve") or default_curve(self.night_slider.get())
+            now = datetime.now()
+            hour = now.hour + now.minute / 60.0
+            try:
+                b = eval_curve(pts, hour) / 100.0
+            except Exception:
+                b = 1.0
+            b = max(0.05, min(1.0, b))
+            return b, f"Custom curve | Brightness {int(round(b * 100))}%"
+
         day = 1.0
         night = self.night_slider.get() / 100.0
         trans = timedelta(minutes=TRANSITION_MINUTES)
