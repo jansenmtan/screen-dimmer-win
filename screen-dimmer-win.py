@@ -7,10 +7,10 @@ from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 
 import tkinter as tk
-from tkinter import ttk
+from tkinter import messagebox, ttk
 
 from astral import Observer
-from astral.sun import sun
+from astral.sun import elevation, sun
 from timezonefinder import TimezoneFinder
 
 # --- 1. WINDOWS API CONFIGURATION ---
@@ -72,7 +72,8 @@ DEFAULT_SETTINGS = {
     "auto_enabled": False,
     "night_brightness": 30,
     "auto_mode": "sun",     # "sun" = follow sunrise/sunset, "curve" = custom 24h curve
-    "auto_curve": None,      # [[hour, brightness%], ...] for custom curve mode
+    "auto_curve": None,      # [[x, brightness%], ...] on the normalized day axis
+    "auto_curve_floor": 0,   # minimum brightness % for the custom curve
 }
 
 TRANSITION_MINUTES = 30  # fade length around sunrise/sunset
@@ -352,6 +353,70 @@ def curve_sector(now, sun):
         return f"{h(sun['sunset'] - now):.1f}h before sunset"
     return f"{h(now - sun['sunset']):.1f}h after sunset"
 
+def clear_sky_irradiance(elev_deg, day_of_year):
+    """Clear-sky irradiance (W/m2) on a horizontal surface.
+
+    Standard direct+diffuse model (Masters 2004, the same methodology NMSU
+    CR674 uses): direct normal A*exp(-B/sin(elev)) projected onto the
+    horizontal plus a diffuse fraction. Returns 0 when the sun is at or
+    below the horizon.
+    """
+    if elev_deg <= 0.0:
+        return 0.0
+    n = day_of_year
+    a = 1160 + 75 * math.sin(math.radians(360.0 / 365 * (n - 275)))
+    b = 0.174 + 0.035 * math.sin(math.radians(360.0 / 365 * (n - 100)))
+    c = 0.095 + 0.04 * math.sin(math.radians(360.0 / 365 * (n - 100)))
+    sinb = math.sin(math.radians(elev_deg))
+    idn = a * math.exp(-b / sinb)
+    return idn * sinb + idn * c
+
+def generate_elevation_curve(sun, lat, lon, tz, floor):
+    """Build a curve on the normalized axis from today's clear-sky irradiance.
+
+    Each x maps to a wall-clock time on the morning axis (or its night
+    extension); solar elevation comes from astral, irradiance from the
+    clear-sky model. Brightness = floor + (100 - floor) * I / I_peak, so the
+    curve hits `floor` at night/sunrise and 100% at solar noon. The result
+    depends on today's sun path (steeper profile in summer, flatter in
+    winter) and is decimated for easy editing.
+    """
+    def h_of(dt):
+        return dt.hour + dt.minute / 60.0
+
+    obs = Observer(lat, lon)
+    tz = tz or datetime.now().astimezone().tzinfo
+    today = datetime.now(tz).date()
+    yday = today.timetuple().tm_yday
+
+    def time_at(x):
+        if x >= 0.0:
+            return sun['sunrise'] + timedelta(hours=x * (sun['noon'] - sun['sunrise']).total_seconds() / 3600.0)
+        return sun['sunrise'] + timedelta(hours=x * (sun['sunrise'] - sun['mid_before']).total_seconds() / 3600.0)
+
+    def irrad_at(x):
+        t = time_at(x).replace(tzinfo=tz)
+        return clear_sky_irradiance(elevation(obs, t), yday)
+
+    irrad = [irrad_at(i * 0.02) for i in range(-50, 51)]
+    peak = max(irrad)
+    if peak <= 0.0:
+        return default_curve(floor)
+
+    out = []
+    last = None
+    for i, irr in enumerate(irrad):
+        xx = round((i - 50) * 0.02, 2)
+        b = round(floor + (100.0 - floor) * irr / peak)
+        if last is None or abs(b - last) >= 4.0:
+            out.append([xx, b])
+            last = b
+    if not out or out[0][0] != -1.0:
+        out.insert(0, [-1.0, round(floor)])
+    if out[-1][0] != 1.0:
+        out.append([1.0, round(floor + (100.0 - floor) * irrad[-1] / peak)])
+    return out
+
 class CurveEditor(tk.Toplevel):
     """Edit the day curve on a normalized, sun-anchored axis.
 
@@ -367,7 +432,7 @@ class CurveEditor(tk.Toplevel):
     MAX_POINTS = 64
     X_MIN, X_MAX = -1.0, 1.0
 
-    def __init__(self, parent, points, night_pct, on_done, get_sun):
+    def __init__(self, parent, points, night_pct, on_done, get_sun, get_gen=None, floor=0.0):
         super().__init__(parent)
         self.title("Auto Brightness Curve \u2014 solar midnight \u2192 sunrise \u2192 solar noon")
         self.resizable(False, False)
@@ -375,10 +440,12 @@ class CurveEditor(tk.Toplevel):
         self.grab_set()
 
         self.night_pct = night_pct
-        self.points = [[float(x), float(b)] for x, b in points
+        self.floor = float(floor)
+        self.points = [[float(x), max(self.floor, float(b))] for x, b in points
                        if self.X_MIN <= float(x) <= self.X_MAX] or default_curve(night_pct)
         self.on_done = on_done
         self.get_sun = get_sun
+        self.get_gen = get_gen
         self.selected = None
         self._clock_job = None
 
@@ -394,11 +461,23 @@ class CurveEditor(tk.Toplevel):
         tk.Label(self, text="The evening mirrors this curve from noon back to midnight.",
                  fg="gray").pack(anchor="w", padx=12)
 
+        floor_row = tk.Frame(self)
+        floor_row.pack(fill="x", padx=12, pady=(6, 0))
+        tk.Label(floor_row, text="Min brightness floor (%)").pack(side="left")
+        self.floor_slider = tk.Scale(floor_row, from_=0, to=50, orient="horizontal",
+                                     command=lambda e: self.on_floor_change(), length=220)
+        self.floor_slider.set(int(self.floor))
+        self.floor_slider.pack(side="left", padx=8)
+
         btns = tk.Frame(self)
         btns.pack(pady=8)
+        self.gen_btn = tk.Button(btns, text="Generate from sun elevation", command=self.generate)
+        self.gen_btn.pack(side="left", padx=6)
         tk.Button(btns, text="Reset to Default", command=self.reset_points).pack(side="left", padx=6)
         tk.Button(btns, text="Cancel", command=self.destroy).pack(side="left", padx=6)
         tk.Button(btns, text="Done", command=self.done).pack(side="left", padx=6)
+        if self.get_gen is None:
+            self.gen_btn.config(state="disabled")
 
         self.canvas.bind("<Button-1>", self.on_press)
         self.canvas.bind("<B1-Motion>", self.on_drag)
@@ -458,6 +537,15 @@ class CurveEditor(tk.Toplevel):
             c.create_line(self.PAD_L, y, self.CW - self.PAD_R, y, fill="#e8e8e8")
             c.create_text(self.PAD_L - 6, y, text=str(b), anchor="e", fill="#888", font=("Segoe UI", 8))
 
+        # floor band: nothing below the min-brightness floor
+        if self.floor > 0.0:
+            yf = self.y_at(self.floor)
+            c.create_rectangle(self.PAD_L, yf, self.CW - self.PAD_R, self.CH - self.PAD_B,
+                               fill="#ffe3e3", stipple="gray50", outline="")
+            c.create_line(self.PAD_L, yf, self.CW - self.PAD_R, yf, fill="#d88", dash=(2, 2))
+            c.create_text(self.PAD_L + 4, max(self.PAD_T + 2, yf - 8),
+                          text=f"floor {round(self.floor)}%", anchor="w", fill="#c77", font=("Segoe UI", 8))
+
         pts = sorted(self.points, key=lambda p: p[0])
         if pts:
             poly = [(self.x_at(x), self.y_at(b)) for x, b in pts]
@@ -506,7 +594,7 @@ class CurveEditor(tk.Toplevel):
         if not (x0 <= event.x <= x1 and y0 <= event.y <= y1):
             return
         x = round(self.x_from(event.x) * 100) / 100.0
-        b = round(self.bright_at(event.y))
+        b = max(self.floor, round(self.bright_at(event.y)))
         for j, (ex, _) in enumerate(self.points):
             if abs(ex - x) < 0.005:
                 self.selected = j  # already a point here; select it instead
@@ -520,7 +608,7 @@ class CurveEditor(tk.Toplevel):
             return
         i = self.selected
         x = round(self.x_from(event.x) * 100) / 100.0
-        b = max(0.0, min(100.0, round(self.bright_at(event.y))))
+        b = max(self.floor, min(100.0, round(self.bright_at(event.y))))
         pts = sorted(self.points, key=lambda p: p[0])
         j = pts.index(self.points[i])
         lo = (pts[j - 1][0] + 0.005) if j > 0 else self.X_MIN
@@ -537,12 +625,34 @@ class CurveEditor(tk.Toplevel):
             del self.points[i]
             self.draw()
 
+    def on_floor_change(self):
+        self.floor = float(self.floor_slider.get())
+        self.points = [[x, max(self.floor, b)] for x, b in self.points]
+        self.draw()
+
+    def generate(self):
+        """Replace the curve with today's clear-sky irradiance profile."""
+        ctx = self.get_gen() if self.get_gen else None
+        if not ctx:
+            messagebox.showwarning(
+                "Location required",
+                "Set a zip code in the main window first (you can open this editor again after).",
+                parent=self)
+            return
+        lat, lon, tz = ctx
+        try:
+            self.points = generate_elevation_curve(self.get_sun(), lat, lon, tz, self.floor)
+        except Exception as exc:
+            messagebox.showerror("Generation failed", str(exc), parent=self)
+            return
+        self.draw()
+
     def reset_points(self):
-        self.points = default_curve(self.night_pct)
+        self.points = [[x, max(self.floor, b)] for x, b in default_curve(self.night_pct)]
         self.draw()
 
     def done(self):
-        self.on_done(sorted(self.points, key=lambda p: p[0]))
+        self.on_done(sorted(self.points, key=lambda p: p[0]), self.floor)
         self.destroy()
 
 # --- 4. GUI APPLICATION ---
@@ -821,12 +931,21 @@ class SunsetApp(tk.Tk):
         if self.auto_var.get():
             self.run_auto_now()
 
+    def _gen_context(self):
+        """(lat, lon, tz) for the curve generator, or None without a location."""
+        if self.lat is None or self.lon is None:
+            return None
+        return (self.lat, self.lon, self.tz)
+
     def open_curve_editor(self):
         pts = self.settings.get("auto_curve") or default_curve(self.night_slider.get())
-        CurveEditor(self, pts, self.night_slider.get(), self.on_curve_edited, self.get_sun_times)
+        floor = float(self.settings.get("auto_curve_floor", 0))
+        CurveEditor(self, pts, self.night_slider.get(), self.on_curve_edited,
+                    self.get_sun_times, self._gen_context, floor)
 
-    def on_curve_edited(self, points):
+    def on_curve_edited(self, points, floor):
         self.settings["auto_curve"] = points
+        self.settings["auto_curve_floor"] = floor
         self.save_settings()
         if self.auto_var.get():
             self.run_auto_now()
@@ -863,6 +982,7 @@ class SunsetApp(tk.Tk):
         """Returns (brightness 0.05-1.0, status text) based on the time of day."""
         if self.auto_mode_var.get() == "curve":
             pts = self.settings.get("auto_curve") or default_curve(self.night_slider.get())
+            floor = float(self.settings.get("auto_curve_floor", 0))
             now = datetime.now(self.tz or datetime.now().astimezone().tzinfo).replace(tzinfo=None)
             sun = self.get_sun_times()
             try:
@@ -870,7 +990,7 @@ class SunsetApp(tk.Tk):
                 sector = curve_sector(now, sun)
             except Exception:
                 b, sector = 1.0, "position unavailable"
-            b = max(0.05, min(1.0, b))
+            b = max(0.05, floor / 100.0, min(1.0, b))
             return b, f"Custom curve | {sector} \u2192 {int(round(b * 100))}%"
 
         day = 1.0
