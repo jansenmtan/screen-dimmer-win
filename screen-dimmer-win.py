@@ -232,15 +232,38 @@ def blend(now, start, end, from_val, to_val):
     return from_val + (to_val - from_val) * f
 
 def default_curve(night_pct):
-    """Seed curve: night level with 30-min fades around 7:00 AM / 7:00 PM."""
+    """Seed curve on the normalized axis: x = -1 solar midnight, 0 sunrise,
+    1 solar noon. Night level with a dawn ramp through sunrise reaching full
+    brightness early in the morning."""
     n = float(night_pct)
-    return [[0.0, n], [6.5, n], [7.0, 100.0], [18.5, 100.0], [19.0, n], [24.0, n]]
+    return [[-1.0, n], [-0.2, n], [0.0, 60.0], [0.2, 100.0], [1.0, 100.0]]
 
-def eval_curve(points, hour):
-    """Brightness (0-100) at `hour` (0-24) on a piecewise-linear 24h curve.
+def eval_curve(points, x):
+    """Brightness (0-100) at normalized position x on the day curve.
 
-    The curve is periodic: the segment after the last point wraps around to
-    the first point (e.g. 22:00 -> 06:00 with no point at midnight)."""
+    x = -1 at solar midnight, 0 at sunrise, 1 at solar noon. The evening is
+    the mirror of the morning (same curve, other half-day). Values extend
+    flat beyond the first/last point.
+    """
+    if not points:
+        return 100.0
+    pts = sorted(points, key=lambda p: p[0])
+    if len(pts) == 1:
+        return pts[0][1]
+    x = max(-1.0, min(1.0, x))
+    if x <= pts[0][0]:
+        return pts[0][1]
+    if x >= pts[-1][0]:
+        return pts[-1][1]
+    for (x0, b0), (x1, b1) in zip(pts, pts[1:]):
+        if x0 <= x < x1:
+            f = (x - x0) / (x1 - x0)
+            return b0 + (b1 - b0) * f
+    return pts[-1][1]
+
+def eval_curve_24h(points, hour):
+    """Legacy: brightness (0-100) at `hour` (0-24) on a periodic 24h curve.
+    Only used to sample saved curves during one-time migration."""
     if not points:
         return 100.0
     pts = sorted(points, key=lambda p: p[0])
@@ -249,7 +272,6 @@ def eval_curve(points, hour):
     hour = hour % 24.0
     first, last = pts[0], pts[-1]
     if hour < first[0] or hour >= last[0]:
-        # wrap-around segment: last point -> first point (next day)
         span = first[0] + 24.0 - last[0]
         if hour >= last[0]:
             t = (hour - last[0]) / span
@@ -262,28 +284,101 @@ def eval_curve(points, hour):
             return b0 + (b1 - b0) * f
     return pts[-1][1]
 
-class CurveEditor(tk.Toplevel):
-    """Edit the 24-hour brightness curve.
+def legacy_is_24h(points):
+    """True if a saved curve still uses the old 24h wall-clock axis."""
+    return any(float(p[0]) > 12.0 + 1e-6 for p in points)
 
-    Drag points to move them, click empty space to add a point, right-click a
-    point to delete it. Brightness is interpolated linearly between points.
+def convert_to_curve(points24, sun):
+    """Fold a legacy 24h curve into the normalized [-1,1] day curve.
+
+    The day is now anchored on sun events and mirrored: each normalized
+    position x maps to a morning wall-clock time and its evening mirror, and
+    the converted brightness is the average of the two legacy readings.
+    Sampled at 0.02 steps, decimated to points whose value changed by >= 4%
+    from the last kept point (plus endpoints), so adjacent points stay far
+    enough apart to drag easily.
+    """
+    def h_of(dt):
+        return dt.hour + dt.minute / 60.0
+
+    def b_at(x):
+        if x >= 0.0:
+            t_m = sun['sunrise'] + timedelta(hours=x * (sun['noon'] - sun['sunrise']).total_seconds() / 3600.0)
+            t_e = sun['sunset'] - timedelta(hours=x * (sun['sunset'] - sun['noon']).total_seconds() / 3600.0)
+        else:
+            xm = -x
+            t_m = sun['sunrise'] - timedelta(hours=xm * (sun['sunrise'] - sun['mid_before']).total_seconds() / 3600.0)
+            t_e = sun['sunset'] + timedelta(hours=xm * (sun['mid_after'] - sun['sunset']).total_seconds() / 3600.0)
+        return (eval_curve_24h(points24, h_of(t_m)) + eval_curve_24h(points24, h_of(t_e))) / 2.0
+
+    out = []
+    last_b = None
+    for i in range(-50, 51):  # x in [-1, 1], 0.02 steps
+        xx = round(i * 0.02, 2)
+        b = round(b_at(xx))
+        if last_b is None or abs(b - last_b) >= 4.0:
+            out.append([xx, b])
+            last_b = b
+    if not out or out[0][0] != -1.0:
+        out.insert(0, [-1.0, round(b_at(-1.0))])
+    if out[-1][0] != 1.0:
+        out.append([1.0, round(b_at(1.0))])
+    return out
+
+def curve_x(now, sun):
+    """Normalized position of `now` on the day curve (mirrored for evening).
+
+    Morning half: x = (t - sunrise) / (noon - sunrise).
+    Night (before sunrise): x = (t - sunrise) / (sunrise - midnight_before).
+    The afternoon/evening mirrors those two onto the same axis.
+    """
+    if now < sun['sunrise']:
+        return (now - sun['sunrise']) / (sun['sunrise'] - sun['mid_before'])
+    if now < sun['noon']:
+        return (now - sun['sunrise']) / (sun['noon'] - sun['sunrise'])
+    if now < sun['sunset']:
+        return (sun['sunset'] - now) / (sun['sunset'] - sun['noon'])
+    return -(now - sun['sunset']) / (sun['mid_after'] - sun['sunset'])
+
+def curve_sector(now, sun):
+    """Human-readable position of `now` relative to the sun events."""
+    def h(dt):
+        return abs(dt.total_seconds()) / 3600.0
+    if now < sun['sunrise']:
+        return f"{h(now - sun['sunrise']):.1f}h before sunrise"
+    if now < sun['noon']:
+        return f"{h(now - sun['sunrise']):.1f}h after sunrise"
+    if now < sun['sunset']:
+        return f"{h(sun['sunset'] - now):.1f}h before sunset"
+    return f"{h(now - sun['sunset']):.1f}h after sunset"
+
+class CurveEditor(tk.Toplevel):
+    """Edit the day curve on a normalized, sun-anchored axis.
+
+    x = -1 at solar midnight, 0 at sunrise, 1 at solar noon. Because morning
+    and evening half-days differ in length (location/season), each side is
+    normalized to its own duration and the evening is the mirror of the
+    morning. Drag points, click empty space to add, right-click to delete.
     """
 
     CW, CH = 620, 300
-    PAD_L, PAD_R, PAD_T, PAD_B = 50, 14, 12, 34
+    PAD_L, PAD_R, PAD_T, PAD_B = 50, 14, 12, 40
     MIN_POINTS = 1
-    MAX_POINTS = 48
+    MAX_POINTS = 64
+    X_MIN, X_MAX = -1.0, 1.0
 
-    def __init__(self, parent, points, night_pct, on_done):
+    def __init__(self, parent, points, night_pct, on_done, get_sun):
         super().__init__(parent)
-        self.title("Auto Brightness Curve \u2014 24h schedule")
+        self.title("Auto Brightness Curve \u2014 solar midnight \u2192 sunrise \u2192 solar noon")
         self.resizable(False, False)
         self.transient(parent)
         self.grab_set()
 
         self.night_pct = night_pct
-        self.points = [[float(h), float(b)] for h, b in points] or default_curve(night_pct)
+        self.points = [[float(x), float(b)] for x, b in points
+                       if self.X_MIN <= float(x) <= self.X_MAX] or default_curve(night_pct)
         self.on_done = on_done
+        self.get_sun = get_sun
         self.selected = None
         self._clock_job = None
 
@@ -295,6 +390,8 @@ class CurveEditor(tk.Toplevel):
         self.status.pack(anchor="w", padx=12)
 
         tk.Label(self, text="Drag points to move \u00b7 click empty space to add \u00b7 right-click a point to delete",
+                 fg="gray").pack(anchor="w", padx=12)
+        tk.Label(self, text="The evening mirrors this curve from noon back to midnight.",
                  fg="gray").pack(anchor="w", padx=12)
 
         btns = tk.Frame(self)
@@ -325,12 +422,14 @@ class CurveEditor(tk.Toplevel):
             self._clock_job = None
         super().destroy()
 
-    # --- geometry ---
-    def x_at(self, hour):
-        return self.PAD_L + hour / 24.0 * (self.CW - self.PAD_L - self.PAD_R)
+    # --- geometry (x in [-1, 1]) ---
+    def x_at(self, x):
+        return self.PAD_L + (x - self.X_MIN) / (self.X_MAX - self.X_MIN) * (self.CW - self.PAD_L - self.PAD_R)
 
-    def hour_at(self, x):
-        return max(0.0, min(24.0, (x - self.PAD_L) / (self.CW - self.PAD_L - self.PAD_R) * 24.0))
+    def x_from(self, px):
+        return max(self.X_MIN, min(self.X_MAX,
+                                   self.X_MIN + (px - self.PAD_L) / (self.CW - self.PAD_L - self.PAD_R)
+                                   * (self.X_MAX - self.X_MIN)))
 
     def y_at(self, bright):
         return self.PAD_T + (1.0 - bright / 100.0) * (self.CH - self.PAD_T - self.PAD_B)
@@ -342,43 +441,53 @@ class CurveEditor(tk.Toplevel):
         c = self.canvas
         c.delete("all")
 
-        # grid: hours every 2h, brightness every 25%
-        for h in range(0, 25, 2):
-            x = self.x_at(h)
+        # vertical grid: -1, -0.5, 0, 0.5, 1
+        for tick in (-1.0, -0.5, 0.0, 0.5, 1.0):
+            x = self.x_at(tick)
             c.create_line(x, self.PAD_T, x, self.CH - self.PAD_B, fill="#e8e8e8")
-            c.create_text(x, self.CH - self.PAD_B + 9, text=str(h), fill="#888", font=("Segoe UI", 8))
+            if tick in (-0.5, 0.5):
+                c.create_text(x, self.CH - self.PAD_B + 11, text=str(tick), fill="#888", font=("Segoe UI", 8))
+        c.create_text(self.x_at(-1.0), self.CH - self.PAD_B + 24, text="solar midnight",
+                      fill="#666", font=("Segoe UI", 8))
+        c.create_text(self.x_at(0.0), self.CH - self.PAD_B + 24, text="sunrise",
+                      fill="#666", font=("Segoe UI", 8))
+        c.create_text(self.x_at(1.0), self.CH - self.PAD_B + 24, text="solar noon",
+                      fill="#666", font=("Segoe UI", 8))
         for b in range(0, 101, 25):
             y = self.y_at(b)
             c.create_line(self.PAD_L, y, self.CW - self.PAD_R, y, fill="#e8e8e8")
             c.create_text(self.PAD_L - 6, y, text=str(b), anchor="e", fill="#888", font=("Segoe UI", 8))
 
-        # polyline, wrapping from the last point to the first point (next day)
         pts = sorted(self.points, key=lambda p: p[0])
         if pts:
-            poly = [(self.x_at(h), self.y_at(b)) for h, b in pts]
-            poly.append((self.x_at(pts[0][0] + 24.0), self.y_at(pts[0][1])))
+            poly = [(self.x_at(x), self.y_at(b)) for x, b in pts]
             c.create_line(poly, fill="#1a6fd0", width=2)
 
-        for h, b in pts:
-            c.create_oval(self.x_at(h) - 5, self.y_at(b) - 5,
-                          self.x_at(h) + 5, self.y_at(b) + 5,
+        for x, b in pts:
+            c.create_oval(self.x_at(x) - 6, self.y_at(b) - 6,
+                          self.x_at(x) + 6, self.y_at(b) + 6,
                           fill="#ff5555", outline="#222", width=1)
 
         # current-time marker
         now = datetime.now()
-        hour = now.hour + now.minute / 60.0
-        bx = eval_curve(pts, hour) if pts else 100.0
-        x = self.x_at(hour)
-        c.create_line(x, self.PAD_T, x, self.CH - self.PAD_B, fill="#d00", dash=(3, 3))
-        c.create_oval(x - 4, self.y_at(bx) - 4, x + 4, self.y_at(bx) + 4, fill="#d00", outline="")
-        self.status.config(text=f"Now: {fmt_time(now)} \u2192 brightness {round(bx)}%")
+        try:
+            sun = self.get_sun()
+            x = curve_x(now, sun)
+            sector = curve_sector(now, sun)
+        except Exception:
+            x, sector = 0.0, "position unavailable"
+        bx = eval_curve(pts, x) if pts else 100.0
+        px = self.x_at(x)
+        c.create_line(px, self.PAD_T, px, self.CH - self.PAD_B, fill="#d00", dash=(3, 3))
+        c.create_oval(px - 4, self.y_at(bx) - 4, px + 4, self.y_at(bx) + 4, fill="#d00", outline="")
+        self.status.config(text=f"Now: {fmt_time(now)} \u00b7 {sector} \u2192 brightness {round(bx)}%")
 
     # --- mouse handling ---
     def _hit(self, event):
-        """Index of the point within 8px of the click, or None."""
-        best, best_d = None, 8.0
-        for i, (h, b) in enumerate(self.points):
-            dx = self.x_at(h) - event.x
+        """Index of the point within 12px of the click, or None."""
+        best, best_d = None, 12.0
+        for i, (x, b) in enumerate(self.points):
+            dx = self.x_at(x) - event.x
             dy = self.y_at(b) - event.y
             d = (dx * dx + dy * dy) ** 0.5
             if d <= best_d:
@@ -396,13 +505,13 @@ class CurveEditor(tk.Toplevel):
         y0, y1 = self.PAD_T, self.CH - self.PAD_B
         if not (x0 <= event.x <= x1 and y0 <= event.y <= y1):
             return
-        h = max(0.0, min(24.0, round(self.hour_at(event.x) * 12) / 12.0))  # 5-min snap
+        x = round(self.x_from(event.x) * 100) / 100.0
         b = round(self.bright_at(event.y))
-        for j, (eh, _) in enumerate(self.points):
-            if abs(eh - h) < 1 / 60:
+        for j, (ex, _) in enumerate(self.points):
+            if abs(ex - x) < 0.005:
                 self.selected = j  # already a point here; select it instead
                 return
-        self.points.append([h, b])
+        self.points.append([x, b])
         self.selected = len(self.points) - 1
         self.draw()
 
@@ -410,13 +519,13 @@ class CurveEditor(tk.Toplevel):
         if self.selected is None:
             return
         i = self.selected
-        h = max(0.0, min(24.0, round(self.hour_at(event.x) * 12) / 12.0))
+        x = round(self.x_from(event.x) * 100) / 100.0
         b = max(0.0, min(100.0, round(self.bright_at(event.y))))
         pts = sorted(self.points, key=lambda p: p[0])
         j = pts.index(self.points[i])
-        lo = (pts[j - 1][0] + 1 / 60) if j > 0 else 0.0
-        hi = (pts[j + 1][0] - 1 / 60) if j < len(pts) - 1 else 24.0
-        self.points[i] = [max(lo, min(hi, h)), b]
+        lo = (pts[j - 1][0] + 0.005) if j > 0 else self.X_MIN
+        hi = (pts[j + 1][0] - 0.005) if j < len(pts) - 1 else self.X_MAX
+        self.points[i] = [max(lo, min(hi, x)), b]
         self.draw()
 
     def on_release(self, event):
@@ -664,11 +773,45 @@ class SunsetApp(tk.Tk):
         self.save_settings()
         self.apply_auto_state()
 
+    def get_sun_times(self):
+        """Today's sun anchors as naive-local datetimes, or a fixed-schedule
+        fallback (sunrise 7:00, sunset 19:00, noon 13:00) when no location."""
+        if self.lat is not None and self.lon is not None:
+            tz = self.tz or datetime.now().astimezone().tzinfo
+            try:
+                s = sun(Observer(self.lat, self.lon), date=datetime.now(tz).date(), tzinfo=tz)
+                noon = s['noon'].replace(tzinfo=None)
+                return {
+                    'mid_before': noon - timedelta(hours=12),
+                    'sunrise': s['sunrise'].replace(tzinfo=None),
+                    'noon': noon,
+                    'sunset': s['sunset'].replace(tzinfo=None),
+                    'mid_after': noon + timedelta(hours=12),
+                }
+            except Exception:
+                pass
+        now = datetime.now()
+        sunrise = now.replace(hour=7, minute=0, second=0, microsecond=0)
+        sunset = now.replace(hour=19, minute=0, second=0, microsecond=0)
+        noon = now.replace(hour=13, minute=0, second=0, microsecond=0)
+        return {
+            'mid_before': noon - timedelta(hours=12),
+            'sunrise': sunrise,
+            'noon': noon,
+            'sunset': sunset,
+            'mid_after': noon + timedelta(hours=12),
+        }
+
     def on_auto_mode_change(self):
         """Switch between sun-synced and custom-curve schedules."""
         if self.auto_mode_var.get() == "curve":
-            if not self.settings.get("auto_curve"):
+            curve = self.settings.get("auto_curve")
+            if not curve:
                 self.settings["auto_curve"] = default_curve(self.night_slider.get())
+            elif legacy_is_24h(curve):
+                # one-time migration: fold a saved 24h wall-clock curve into
+                # the normalized sun-anchored curve (morning/evening averaged)
+                self.settings["auto_curve"] = convert_to_curve(curve, self.get_sun_times())
             self.night_slider.config(state="disabled")
             self.curve_btn.config(state="normal")
         else:
@@ -680,7 +823,7 @@ class SunsetApp(tk.Tk):
 
     def open_curve_editor(self):
         pts = self.settings.get("auto_curve") or default_curve(self.night_slider.get())
-        CurveEditor(self, pts, self.night_slider.get(), self.on_curve_edited)
+        CurveEditor(self, pts, self.night_slider.get(), self.on_curve_edited, self.get_sun_times)
 
     def on_curve_edited(self, points):
         self.settings["auto_curve"] = points
@@ -720,14 +863,15 @@ class SunsetApp(tk.Tk):
         """Returns (brightness 0.05-1.0, status text) based on the time of day."""
         if self.auto_mode_var.get() == "curve":
             pts = self.settings.get("auto_curve") or default_curve(self.night_slider.get())
-            now = datetime.now()
-            hour = now.hour + now.minute / 60.0
+            now = datetime.now(self.tz or datetime.now().astimezone().tzinfo).replace(tzinfo=None)
+            sun = self.get_sun_times()
             try:
-                b = eval_curve(pts, hour) / 100.0
+                b = eval_curve(pts, curve_x(now, sun)) / 100.0
+                sector = curve_sector(now, sun)
             except Exception:
-                b = 1.0
+                b, sector = 1.0, "position unavailable"
             b = max(0.05, min(1.0, b))
-            return b, f"Custom curve | Brightness {int(round(b * 100))}%"
+            return b, f"Custom curve | {sector} \u2192 {int(round(b * 100))}%"
 
         day = 1.0
         night = self.night_slider.get() / 100.0
