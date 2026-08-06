@@ -568,6 +568,8 @@ class CurveEditor(tk.Toplevel):
         px = self.x_at(x)
         c.create_line(px, self.PAD_T, px, self.CH - self.PAD_B, fill="#d00", dash=(3, 3))
         c.create_oval(px - 4, self.y_at(bx) - 4, px + 4, self.y_at(bx) + 4, fill="#d00", outline="")
+        tx = min(max(px, self.PAD_L + 14), self.CW - self.PAD_R - 14)
+        c.create_text(tx, self.PAD_T + 2, text="now", anchor="n", fill="#d00", font=("Segoe UI", 8))
         self.status.config(text=f"Now: {fmt_time(now)} \u00b7 {sector} \u2192 brightness {round(bx)}%")
 
     # --- mouse handling ---
@@ -660,7 +662,6 @@ class SunsetApp(tk.Tk):
     def __init__(self):
         super().__init__()
         self.title("Custom Sunset Screen")
-        self.geometry("400x720")
         self.resizable(False, False)
 
         # Prevent screen from staying tinted if the app is closed
@@ -687,8 +688,8 @@ class SunsetApp(tk.Tk):
         self.create_widgets()
 
         # Restore saved location, if any
+        self.refresh_location_summary()
         if self.lat is not None and self.lon is not None and self.loc_name:
-            self.loc_label.config(text=f"Location: {self.loc_name}", fg="black")
             self.calculate_sunset()
 
         # Apply saved auto-brightness state and start the periodic timer
@@ -698,36 +699,16 @@ class SunsetApp(tk.Tk):
         self.start_watchdog()
 
     def create_widgets(self):
-        # --- Location Section ---
-        loc_frame = tk.LabelFrame(self, text="Location", padx=10, pady=10)
-        loc_frame.pack(padx=10, pady=10, fill="x")
+        # --- Live status header ---
+        self.header_label = tk.Label(self, text="", font=("Segoe UI", 10, "bold"))
+        self.header_label.pack(padx=12, pady=(10, 0), anchor="w")
 
-        tk.Label(loc_frame, text="Zip Code:").grid(row=0, column=0, sticky="w")
-        self.zip_entry = tk.Entry(loc_frame, width=10)
-        self.zip_entry.grid(row=0, column=1, padx=5)
-        saved_zip = self.settings.get("zip_code", "")
-        if saved_zip:
-            self.zip_entry.insert(0, saved_zip)
-
-        tk.Button(loc_frame, text="Set Location", command=self.fetch_location).grid(row=0, column=2, padx=5)
-
-        self.loc_label = tk.Label(loc_frame, text="Not set", fg="gray")
-        self.loc_label.grid(row=1, column=0, columnspan=3, pady=(5,0), sticky="w")
-
-        self.sunset_label = tk.Label(loc_frame, text="Sunset: N/A", fg="gray")
-        self.sunset_label.grid(row=2, column=0, columnspan=3, sticky="w")
-
-        # --- Mode Selection ---
+        # --- Color mode state (the selector itself lives in Advanced) ---
         self.mode_var = tk.StringVar(value="temp")
-
-        mode_frame = tk.Frame(self)
-        mode_frame.pack(pady=5)
-        tk.Radiobutton(mode_frame, text="Temperature Mode", variable=self.mode_var, value="temp", command=self.toggle_modes).pack(side="left", padx=10)
-        tk.Radiobutton(mode_frame, text="RGB Mode", variable=self.mode_var, value="rgb", command=self.toggle_modes).pack(side="left", padx=10)
+        self._advanced_dlg = None
 
         # --- Temperature/Brightness Mode Frame ---
         self.temp_frame = tk.LabelFrame(self, text="Temperature & Brightness", padx=10, pady=10)
-        self.temp_frame.pack(padx=10, pady=5, fill="both", expand=True)
 
         tk.Label(self.temp_frame, text="Color Temp (Kelvin)").pack()
         self.temp_slider = tk.Scale(self.temp_frame, from_=1000, to=6500, orient="horizontal", command=lambda e: self.update_screen())
@@ -741,7 +722,7 @@ class SunsetApp(tk.Tk):
 
         # --- RGB Mode Frame ---
         self.rgb_frame = tk.LabelFrame(self, text="RGB Intensity", padx=10, pady=10)
-        # Packed/Unpacked via toggle_modes
+        # Packed/unpacked via toggle_modes
 
         tk.Label(self.rgb_frame, text="Red (%)").pack()
         self.r_slider = tk.Scale(self.rgb_frame, from_=0, to=100, orient="horizontal", fg="red", command=lambda e: self.update_screen())
@@ -758,49 +739,141 @@ class SunsetApp(tk.Tk):
         self.b_slider.set(100)
         self.b_slider.pack(fill="x")
 
-        # --- Auto Brightness Frame ---
-        auto_frame = tk.LabelFrame(self, text="Auto Brightness", padx=10, pady=10)
-        auto_frame.pack(padx=10, pady=5, fill="x")
+        # --- Auto Brightness ---
+        self.auto_frame = tk.LabelFrame(self, text="Auto Brightness", padx=10, pady=8)
+        self.auto_frame.pack(padx=10, pady=5, fill="x")
 
         self.auto_var = tk.BooleanVar(value=bool(self.settings.get("auto_enabled", False)))
-        tk.Checkbutton(auto_frame, text="Auto-adjust by time of day",
+        tk.Checkbutton(self.auto_frame, text="Auto-adjust by time of day",
                        variable=self.auto_var, command=self.toggle_auto).pack(anchor="w")
 
+        # Sub-controls: only visible while auto is enabled
+        self.auto_details = tk.Frame(self.auto_frame)
+
         self.auto_mode_var = tk.StringVar(value=self.settings.get("auto_mode", "sun"))
-        mode_row = tk.Frame(auto_frame)
-        mode_row.pack(anchor="w", pady=(5, 0))
+        mode_row = tk.Frame(self.auto_details)
+        mode_row.pack(anchor="w", pady=(4, 0))
         tk.Radiobutton(mode_row, text="Follow sunrise/sunset", variable=self.auto_mode_var,
                        value="sun", command=self.on_auto_mode_change).pack(side="left")
         tk.Radiobutton(mode_row, text="Custom curve", variable=self.auto_mode_var,
                        value="curve", command=self.on_auto_mode_change).pack(side="left", padx=(10, 0))
 
-        self.curve_btn = tk.Button(auto_frame, text="Edit Curve\u2026", command=self.open_curve_editor)
-        self.curve_btn.pack(anchor="w", pady=(5, 0))
-
-        tk.Label(auto_frame, text="Night Brightness (%)").pack(anchor="w", pady=(5, 0))
-        self.night_slider = tk.Scale(auto_frame, from_=5, to=100, orient="horizontal",
-                                     command=lambda e: self.on_night_change())
+        # Night brightness applies only to the sunrise/sunset schedule; the
+        # custom curve owns its floor in the curve editor.
+        self.night_row = tk.Frame(self.auto_details)
+        tk.Label(self.night_row, text="Night Brightness (%)").pack(side="left")
+        self.night_slider = tk.Scale(self.night_row, from_=5, to=100, orient="horizontal",
+                                     command=lambda e: self.on_night_change(), length=170)
         self.night_slider.set(int(self.settings.get("night_brightness", 30)))
-        self.night_slider.pack(fill="x")
+        self.night_slider.pack(side="left", padx=8)
 
-        self.auto_status = tk.Label(auto_frame, text="Off", fg="gray")
-        self.auto_status.pack(anchor="w", pady=(5, 0))
+        self.curve_btn = tk.Button(self.auto_details, text="Edit Curve\u2026", command=self.open_curve_editor)
 
-        self.on_auto_mode_change()
+        self.sun_times_label = tk.Label(self.auto_details, text="", fg="gray")
+        self.sun_times_label.pack(anchor="w", pady=(4, 0))
 
-        # --- Reset Button ---
-        tk.Button(self, text="Reset to Normal (Daylight)", bg="lightgray", command=self.reset_screen).pack(pady=10)
+        self.auto_status = tk.Label(self.auto_details, text="", fg="black")
+        self.auto_status.pack(anchor="w")
 
-        self.toggle_modes() # Initialize correct frame visibility
+        # --- Location (one-time setup, collapsed by default) ---
+        loc_frame = tk.Frame(self, padx=12)
+        loc_frame.pack(pady=(6, 0), fill="x")
+        self.loc_summary = tk.Label(loc_frame, text="", anchor="w")
+        self.loc_summary.pack(side="left")
+        self.loc_edit_btn = tk.Button(loc_frame, text="Change\u2026", command=self.toggle_location_editor)
+        self.loc_edit_btn.pack(side="right")
+
+        self.loc_editor = tk.Frame(self, padx=12)
+        row = tk.Frame(self.loc_editor)
+        row.pack(fill="x", pady=(4, 0))
+        tk.Label(row, text="Zip Code:").pack(side="left")
+        self.zip_entry = tk.Entry(row, width=8)
+        saved_zip = self.settings.get("zip_code", "")
+        if saved_zip:
+            self.zip_entry.insert(0, saved_zip)
+        self.zip_entry.pack(side="left", padx=5)
+        tk.Button(row, text="Set Location", command=self.fetch_location).pack(side="left")
+        self.loc_feedback = tk.Label(self.loc_editor, text="", fg="red", anchor="w")
+        self.loc_feedback.pack(fill="x")
+
+        # --- Advanced ---
+        self.advanced_btn = tk.Button(self, text="Advanced\u2026", command=self.open_advanced)
+        self.advanced_btn.pack(pady=(10, 8))
+
+        self.toggle_modes()         # show the slider frame for the current mode
+        self.toggle_auto_details()  # show/hide auto sub-controls
+        self.on_auto_mode_change()  # show night slider vs curve button
 
     def toggle_modes(self):
         if self.mode_var.get() == "temp":
             self.rgb_frame.pack_forget()
-            self.temp_frame.pack(padx=10, pady=5, fill="both", expand=True)
+            self.temp_frame.pack(padx=10, pady=5, fill="x", before=self._auto_anchor())
         else:
             self.temp_frame.pack_forget()
-            self.rgb_frame.pack(padx=10, pady=5, fill="both", expand=True)
+            self.rgb_frame.pack(padx=10, pady=5, fill="x", before=self._auto_anchor())
         self.update_screen()
+
+    def _auto_anchor(self):
+        """The auto frame sits below the slider frames; pack before it."""
+        return self.auto_frame
+
+    def toggle_auto_details(self):
+        if self.auto_var.get():
+            self.auto_details.pack(fill="x", pady=(2, 0))
+        else:
+            self.auto_details.pack_forget()
+
+    def refresh_header(self):
+        """One-line live status: color mode, brightness, auto state."""
+        if self.mode_var.get() == "temp":
+            color = f"{self.temp_slider.get()}K"
+            manual_bright = self.bright_slider.get()
+        else:
+            color = f"R{self.r_slider.get()}% G{self.g_slider.get()}% B{self.b_slider.get()}%"
+            manual_bright = 100  # RGB mode applies no extra dimming manually
+        if self.auto_var.get():
+            bright = int(round(self.auto_brightness * 100))
+            state = "Auto on"
+        else:
+            bright = manual_bright
+            state = "Auto off"
+        self.header_label.config(text=f"{color} \u00b7 {bright}% \u00b7 {state}")
+
+    def refresh_location_summary(self):
+        if self.loc_name:
+            zip_code = self.settings.get("zip_code", "")
+            suffix = f" ({zip_code})" if zip_code else ""
+            self.loc_summary.config(text=f"Location: {self.loc_name}{suffix}", fg="black")
+            self.loc_edit_btn.config(text="Change\u2026")
+        else:
+            self.loc_summary.config(text="Location: not set", fg="gray")
+            self.loc_edit_btn.config(text="Set\u2026")
+
+    def toggle_location_editor(self):
+        if self.loc_editor.winfo_ismapped():
+            self.loc_editor.pack_forget()
+        else:
+            self.loc_editor.pack(fill="x", before=self.advanced_btn)
+
+    def open_advanced(self):
+        if self._advanced_dlg is not None and self._advanced_dlg.winfo_exists():
+            self._advanced_dlg.lift()
+            return
+        dlg = tk.Toplevel(self)
+        self._advanced_dlg = dlg
+        dlg.title("Advanced")
+        dlg.resizable(False, False)
+        dlg.transient(self)
+
+        mode_frame = tk.LabelFrame(dlg, text="Color Mode", padx=10, pady=8)
+        mode_frame.pack(padx=10, pady=(10, 5), fill="x")
+        tk.Radiobutton(mode_frame, text="Temperature", variable=self.mode_var,
+                       value="temp", command=self.toggle_modes).pack(anchor="w")
+        tk.Radiobutton(mode_frame, text="RGB channels", variable=self.mode_var,
+                       value="rgb", command=self.toggle_modes).pack(anchor="w")
+
+        tk.Button(dlg, text="Reset Screen to Normal", bg="lightgray",
+                  command=self.reset_screen).pack(padx=10, pady=(5, 10), fill="x")
 
     def load_settings(self):
         try:
@@ -840,25 +913,27 @@ class SunsetApp(tk.Tk):
     def fetch_location(self):
         zip_code = self.zip_entry.get().strip()
         if not zip_code.isdigit() or len(zip_code) != 5:
-            self.loc_label.config(text="Invalid Zip Code", fg="red")
+            self.loc_feedback.config(text="Invalid Zip Code")
             return
 
         result = get_location_from_zip(zip_code)
         if result:
             self.lat, self.lon, name = result
             self.loc_name = name
-            self.loc_label.config(text=f"Location: {name}", fg="black")
             try:
                 tz_str = TimezoneFinder().timezone_at(lat=self.lat, lng=self.lon)
                 self.tz = ZoneInfo(tz_str) if tz_str else None
             except Exception:
                 self.tz = None
-            self.save_settings()
+            self.loc_feedback.config(text="")
+            self.save_settings()  # also stores the zip code
+            self.refresh_location_summary()
+            self.loc_editor.pack_forget()
             self.calculate_sunset()
             if self.auto_var.get():
                 self.run_auto_now()  # location may change the auto schedule
         else:
-            self.loc_label.config(text="Zip Code not found", fg="red")
+            self.loc_feedback.config(text="Zip Code not found")
 
     def calculate_sunset(self):
         if self.lat is None or self.lon is None:
@@ -872,14 +947,15 @@ class SunsetApp(tk.Tk):
             s = sun(Observer(self.lat, self.lon), date=now_local.date(), tzinfo=tz)
             sunrise_time = fmt_time(s['sunrise'])
             sunset_time = fmt_time(s['sunset'])
-            self.sunset_label.config(
-                text=f"Sunrise: {sunrise_time}   Sunset: {sunset_time}", fg="black")
+            self.sun_times_label.config(
+                text=f"Sunrise {sunrise_time} \u00b7 Sunset {sunset_time}", fg="gray")
         except Exception:
-            self.sunset_label.config(
+            self.sun_times_label.config(
                 text="Sun times unavailable for this date/location", fg="red")
 
     # --- Auto Brightness ---
     def toggle_auto(self):
+        self.toggle_auto_details()
         self.save_settings()
         self.apply_auto_state()
 
@@ -922,11 +998,12 @@ class SunsetApp(tk.Tk):
                 # one-time migration: fold a saved 24h wall-clock curve into
                 # the normalized sun-anchored curve (morning/evening averaged)
                 self.settings["auto_curve"] = convert_to_curve(curve, self.get_sun_times())
-            self.night_slider.config(state="disabled")
-            self.curve_btn.config(state="normal")
+            # The curve owns its floor in the editor; hide the sun-mode slider
+            self.night_row.pack_forget()
+            self.curve_btn.pack(anchor="w", pady=(4, 0), before=self.sun_times_label)
         else:
-            self.night_slider.config(state="normal")
-            self.curve_btn.config(state="disabled")
+            self.curve_btn.pack_forget()
+            self.night_row.pack(fill="x", pady=(4, 0), before=self.sun_times_label)
         self.save_settings()
         if self.auto_var.get():
             self.run_auto_now()
@@ -958,7 +1035,7 @@ class SunsetApp(tk.Tk):
         else:
             self.bright_slider.config(state="normal")
             self.auto_brightness = 1.0
-            self.auto_status.config(text="Off", fg="gray")
+            self.auto_status.config(text="")
             self.update_screen()
 
     def on_night_change(self):
@@ -991,7 +1068,7 @@ class SunsetApp(tk.Tk):
             except Exception:
                 b, sector = 1.0, "position unavailable"
             b = max(0.05, floor / 100.0, min(1.0, b))
-            return b, f"Custom curve | {sector} \u2192 {int(round(b * 100))}%"
+            return b, f"{int(round(b * 100))}% \u00b7 {sector}"
 
         day = 1.0
         night = self.night_slider.get() / 100.0
@@ -1019,17 +1096,17 @@ class SunsetApp(tk.Tk):
             trans = timedelta(minutes=60)
 
         if now < sunrise:
-            b, phase = night, f"Night - sunrise {fmt_time(sunrise)}"
+            b, phase = night, f"night \u00b7 sunrise {fmt_time(sunrise)}"
         elif now < sunrise + trans:
-            b, phase = blend(now, sunrise, sunrise + trans, night, day), "Sunrise fade-in"
+            b, phase = blend(now, sunrise, sunrise + trans, night, day), "sunrise fade-in"
         elif now < sunset - trans:
-            b, phase = day, f"Day - sunset {fmt_time(sunset)}"
+            b, phase = day, f"day \u00b7 sunset {fmt_time(sunset)}"
         elif now < sunset:
-            b, phase = blend(now, sunset - trans, sunset, day, night), "Sunset fade-out"
+            b, phase = blend(now, sunset - trans, sunset, day, night), "sunset fade-out"
         else:
-            b, phase = night, "Night - sunrise tomorrow"
+            b, phase = night, "night \u00b7 sunrise tomorrow"
 
-        status = f"{phase} | Brightness {int(round(b * 100))}%{source}"
+        status = f"{int(round(b * 100))}% \u00b7 {phase}{source}"
         return max(0.05, min(1.0, b)), status
 
     def update_screen(self):
@@ -1053,6 +1130,8 @@ class SunsetApp(tk.Tk):
             # In RGB mode, auto brightness applies as a multiplier if enabled
             brightness = self.auto_brightness if self.auto_var.get() else 1.0
             apply_gamma(r_mult, g_mult, b_mult, brightness)
+
+        self.refresh_header()
 
     # --- Gamma watchdog: detect & repair external resets/overwrites ---
     def start_watchdog(self):
