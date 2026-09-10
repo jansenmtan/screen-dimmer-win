@@ -1,77 +1,190 @@
 # screen-dimmer-win
 
-A Windows gamma-ramp dimmer / tint utility (brightness, colour temperature, and an
-auto-brightness curve that follows sunrise/sunset). It drives the display through
-`SetDeviceGammaRamp`, with a watchdog that re-applies the ramp if another app or a
+A single-file Windows tray app that dims your screen below the hardware minimum,
+tints it warm at night, and can follow the sun with an auto-brightness curve you
+draw yourself.
+
+It works by rewriting the display's **gamma ramp**, so it can go much dimmer than
+the monitor's own backlight control, and it repairs the ramp if another app or a
 display event resets it.
 
-Requires Python >= 3.12. Run with `run.ps1` (i.e. `uv run screen-dimmer-win.py`).
+![Main window](docs/screenshots/main-window.png)
 
----
+## Features
 
-## Notice for OLED monitor users: G-SYNC / VRR can brighten fullscreen content
+- **Brightness 5–100 %** via a gamma-ramp LUT — dimmer than the monitor OSD allows.
+- **Colour temperature 1000–6500 K** (6500 K = untouched screen).
+- **Per-channel RGB balance** for arbitrary tints.
+- **Auto brightness**, two schedules:
+  - *Follow sunrise/sunset* — computed from your location with 30-minute fades and
+    a configurable night level.
+  - *Custom curve* — a 24-hour curve on a sun-anchored axis, with a minimum-brightness
+    floor and a one-click "generate from sun elevation" curve.
+- **Location from a US zip code** (geocoding + timezone lookup); without a location
+  it falls back to a fixed 07:00–19:00 schedule.
+- **Settings persist** to `settings.json` next to the script.
+- **Minimize to tray** (optional; requires `pystray` + `Pillow`).
+- **Watchdog + event-driven repair** — Windows has no gamma-change notification, so a
+  2 s poll runs alongside hooks for foreground changes and display/device events,
+  which re-apply the ramp immediately when a game or a mode switch stomps it.
+- **Always resets the screen** to an identity ramp on exit.
 
-**If fullscreen games look washed-out or brighter than the same app windowed, the
-cause is probably your monitor's variable refresh rate — not this dimmer.**
+## Requirements
 
-### Symptom
+- Windows 10/11
+- Python 3.12+
+- [`uv`](https://docs.astral.sh/uv/) (recommended) or `pip`
+- **HDR off** — gamma ramps are ignored in HDR mode
 
-- Fullscreen (independent-flip) presentation looks brighter / washed-out versus the
-  same content in a window.
-- Often accompanied by the brightness *fluctuating* during play.
-- Reproduces even with this app fully quit and an identity gamma ramp.
+## Install and run
 
-### What we verified
+### With uv
 
-Test setup: ASUS ROG Swift OLED PG27AQWP-W (540 Hz WOLED), NVIDIA GTX 1660,
-Windows 11 build 26200, HDR off.
+```powershell
+git clone https://github.com/jansenmtan/screen-dimmer-win.git
+cd screen-dimmer-win
+uv run screen-dimmer-win.py    # or: .\run.ps1
+```
+
+### With plain Python
+
+```powershell
+py -3.12 -m venv .venv
+.\.venv\Scripts\pip install -r requirements.txt
+.\.venv\Scripts\python screen-dimmer-win.py
+```
+
+### Start automatically at login
+
+`autostart.vbs` launches the app through `.venv\Scripts\pythonw.exe`, so there is no
+console window. Put a shortcut to it in `shell:startup`
+(<kbd>Win</kbd>+<kbd>R</kbd> → `shell:startup`).
+
+## Using it
+
+The header line always shows the live state: colour temperature or RGB, current
+brightness, and whether auto is on.
+
+| Control | What it does |
+|---|---|
+| **Color Temp (Kelvin)** | Warmer as you slide left; 6500 K is a no-op. |
+| **Brightness (%)** | Manual dimming. Disabled while auto brightness is on. |
+| **Auto-adjust by time of day** | Enables the schedule; the sub-controls appear underneath. |
+| **Night Brightness** | Floor level for the sunrise/sunset schedule. |
+| **Edit Curve…** | Opens the curve editor (custom-curve mode only). |
+| **Advanced…** | Colour mode switch, minimize-to-tray toggle, and *Reset Screen to Normal*. |
+| **Change…** (location) | Enter a US zip code to set lat/lon + timezone. |
+
+### The curve editor
+
+![Curve editor](docs/screenshots/curve-editor.png)
+
+The curve is drawn on a **normalized, sun-anchored axis**: `x = -1` is solar
+midnight, `x = 0` is sunrise, `x = 1` is solar noon. Because mornings and evenings
+differ in length by season and latitude, each half-day is normalized to its own
+duration and the evening is the mirror of the morning — so the curve stays correct
+all year without editing it.
+
+- Drag a point to move it, click empty space to add one, right-click a point to delete.
+- **Min brightness floor** clamps the whole curve from below (0–50 %).
+- **Generate from sun elevation** builds a clear-sky irradiance curve for your location.
+- The vertical marker shows where "now" sits on the curve.
+
+## Troubleshooting
+
+### Fullscreen content looks brighter / washed out (G-SYNC and VRR)
+
+If fullscreen games look brighter than the same app windowed, the likely cause is
+your monitor's variable refresh rate, **not** this app — it reproduces with the
+dimmer fully quit and an identity gamma ramp.
+
+Verified on an ASUS ROG Swift OLED PG27AQWP-W (540 Hz WOLED), NVIDIA GTX 1660,
+Windows 11 build 26200, HDR off:
 
 | Test | Result |
 |---|---|
-| G-SYNC on, fullscreen vs windowed (osu!lazer, The Bazaar) | brighter fullscreen; osu also flickered |
-| G-SYNC off | brightness difference gone in both apps |
-| G-SYNC back on (osu!lazer) | brighter fullscreen returned, plus visible brightness flicker |
-| G-SYNC **off**, identical borderless dark grey (`iflip_test.exe`), monitor-verified 120 Hz vs 540 Hz | noticeably **brighter at 120 Hz**, darker at 540 Hz |
-| Gamma ramp readback across the transitions | unchanged — the LUT is not being reset or bypassed |
+| G-SYNC on, fullscreen vs windowed | brighter fullscreen; flicker during play in one app |
+| G-SYNC off | brightness difference gone |
+| G-SYNC back on | brighter fullscreen returned |
+| G-SYNC **off**, identical borderless dark grey, monitor-verified 120 Hz vs 540 Hz | noticeably **brighter at 120 Hz**, darker at 540 Hz |
+| Gamma ramp readback across the transitions | unchanged — the LUT is not reset or bypassed |
 
-The decisive point is the last two rows together: **the same pixels at the same gamma
-ramp are displayed at different brightness depending only on the panel's refresh rate.**
+So the same pixels at the same gamma ramp are displayed at different brightness
+depending only on the panel's refresh rate: OLED gamma is calibrated for a
+particular refresh rate, and with G-SYNC on the refresh rate follows the app's
+frame delivery. **No fix belongs in this app.**
 
-### Why G-SYNC triggers it
+**Workaround:** disable G-SYNC / Adaptive-Sync (NVIDIA Control Panel → *Set up
+G-SYNC*) and run a fixed refresh rate. If you test this yourself, verify the
+actual refresh rate **with the monitor's OSD**, not Windows — a fullscreen app can
+request its own display mode and silently invalidate the comparison.
 
-With G-SYNC on, the monitor's refresh rate follows the application's frame delivery
-instead of sitting at a fixed rate. On OLED panels, low-level gamma is calibrated for a
-particular refresh rate, so a changing refresh rate changes how dark and mid-tones are
-displayed. Frame-time variation then shows up as brightness flicker.
+### The screen is still dim after the app crashed
 
-This is a display-side effect: the gamma ramp this app writes is intact and unchanged
-while it happens. **No fix belongs in this app.**
+Gamma ramps are volatile, so a hard crash can leave a dim screen. Run the app again
+and press **Reset Screen to Normal** in *Advanced…*, or log out and back in.
 
-The measurement above establishes *refresh-dependent output brightness*. It does not by
-itself separate the panel's own gamma behaviour from a refresh-dependent conversion in
-the GPU/driver path — both remain possible, though the panel is the likely source.
+### A fullscreen game overrides the dimming
 
-### Workaround
+Exclusive-fullscreen apps can write their own ramp. The watchdog restores yours
+within ~2 s, and the foreground/display hooks usually catch it instantly. If a game
+fights the app, run it borderless-windowed or in SDR.
 
-**Disable G-SYNC / Adaptive-Sync** (NVIDIA Control Panel → *Set up G-SYNC* → uncheck
-*Enable G-SYNC, G-SYNC Compatible*) and run a fixed refresh rate. On the monitor above
-this removed both the steady brightening and the flicker, with no objectionable tearing
-noticed at 540 Hz.
+### Auto brightness sits at 100 % at night
 
-If you want adaptive sync back, test it per game — the effect is not equally visible in
-every application.
+The sunrise/sunset schedule needs a location. Without one it falls back to a fixed
+07:00–19:00 day, which may not match your evening. Set your zip code, or switch to
+custom-curve mode and lower the curve.
 
-### If you test this yourself
+## Known limitations
 
-- **Verify the actual refresh rate with the monitor's own OSD, not Windows.** Fullscreen
-  applications can request their own display mode: during this investigation the desktop
-  was set to 120 Hz while a fullscreen game kept running the monitor at 540 Hz, which
-  silently invalidated an A/B comparison.
-- Compare identical content at two *verified* refresh rates with G-SYNC off; that is the
-  cleanest way to see whether your panel does this.
-- Don't trust eyeball comparisons of white on a changing background (simultaneous
-  contrast misleads easily). Locked-exposure photos compared with `photo_compare.py`
-  are the reliable method used in this repo.
+- **HDR must be off.** Gamma ramps have no effect on HDR output.
+- **Written to the desktop DC** (`GetDC(NULL)`), not to a specific monitor handle, so
+  per-monitor control on mixed-GPU setups is not supported.
+- **Windows only**, and it runs from source — there is no installer or signed binary.
+- **Gamma ramps are volatile.** They are lost on driver restart or reboot, which is
+  why the app re-applies them on a timer and after display events.
+- Some drivers quantize the 8-bit LUT on read-back; the watchdog uses a tolerance so
+  this does not trigger spurious repairs.
 
-See `IFLIP_HANDOFF.md` for the full investigation history, tooling (`iflip_test.exe`),
-and the measurement caveats.
+## How it works
+
+- `SetDeviceGammaRamp` on a 256-entry LUT applies brightness and per-channel
+  multipliers; colour temperature uses the Tanner Helland Kelvin → RGB approximation,
+  normalized so 6500 K is exactly the identity ramp.
+- Sun times come from [Astral](https://github.com/sffjunkie/astral); the timezone is
+  resolved with [timezonefinder](https://github.com/jannikmi/timezonefinder); zip
+  codes are geocoded through [Zippopotam.us](https://api.zippopotam.us).
+- A watchdog thread polls the hardware ramp every 2 s, while a hidden Win32 window
+  plus a `SetWinEventHook` foreground hook catch `WM_DISPLAYCHANGE`,
+  `WM_SETTINGCHANGE` and `WM_DEVICECHANGE`, triggering an immediate check followed by
+  short re-checks (15–1200 ms).
+- The tray icon uses [pystray](https://github.com/moses-palmer/pystray) + Pillow, and
+  is optional at runtime.
+
+## Project layout
+
+```
+screen-dimmer-win.py    the entire app (GUI, gamma, sun/curve math, watchdog, tray)
+autostart.vbs           console-free launcher for login startup
+run.ps1                 uv launcher
+pyproject.toml          project metadata + dependencies (uv)
+requirements.txt        same dependencies for plain pip
+uv.lock                 locked dependency versions
+docs/screenshots/       images used by this README
+settings.json           created at runtime (gitignored)
+gamma_watchdog.log      runtime log (gitignored)
+```
+
+## Credits
+
+- Kelvin → RGB: Tanner Helland's approximation.
+- Sun position and daylight: [Astral](https://github.com/sffjunkie/astral).
+- Timezone lookup: [timezonefinder](https://github.com/jannikmi/timezonefinder).
+- Zip-code geocoding: [Zippopotam.us](https://api.zippopotam.us).
+- Tray icon: [pystray](https://github.com/moses-palmer/pystray) and
+  [Pillow](https://python-pillow.org/).
+
+## License
+
+[MIT](LICENSE) © 2026 Jansen Tan
