@@ -1,4 +1,4 @@
-# Python-generated files
+# --- Python ---
 __pycache__/
 *.py[oc]
 build/
@@ -6,9 +6,15 @@ dist/
 wheels/
 *.egg-info
 
-# Virtual environments
-.venv
+# --- Virtual environments ---
+.venv/
+venv/
 
-# User data / logs (machine-specific, not source)
+# --- Runtime state (machine-specific, written next to the script) ---
 settings.json
 gamma_watchdog.log
+
+# --- OS cruft ---
+Thumbs.db
+Desktop.ini
+.DS_Store

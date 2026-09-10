@@ -1,9 +1,30 @@
 [project]
 name = "screen-dimmer-win"
 version = "0.1.0"
-description = "Add your description here"
+description = "Windows gamma-ramp screen dimmer with colour temperature, RGB balance, and a sun-synced auto-brightness curve."
 readme = "README.md"
 requires-python = ">=3.12"
+license = "MIT"
+authors = [{ name = "Jansen Tan" }]
+keywords = [
+    "dimmer",
+    "gamma",
+    "brightness",
+    "color-temperature",
+    "night-light",
+    "blue-light",
+    "windows",
+    "tray",
+]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Environment :: Win32 (MS Windows)",
+    "Intended Audience :: End Users/Desktop",
+    "Operating System :: Microsoft :: Windows",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Desktop Environment",
+    "Topic :: Utilities",
+]
 dependencies = [
     "astral>=3.2",
     "pytz>=2026.2",
@@ -11,3 +32,10 @@ dependencies = [
     "pystray>=0.19.5",
     "Pillow>=12.0",
 ]
+
+[project.urls]
+Repository = "https://github.com/jansenmtan/screen-dimmer-win"
+Issues = "https://github.com/jansenmtan/screen-dimmer-win/issues"
+
+[tool.uv]
+package = false
