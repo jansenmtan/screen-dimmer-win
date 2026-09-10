@@ -830,11 +830,13 @@ class CurveEditor(tk.Toplevel):
             c.create_line(x, self.PAD_T, x, self.CH - self.PAD_B, fill="#e8e8e8")
             if tick in (-0.5, 0.5):
                 c.create_text(x, self.CH - self.PAD_B + 11, text=str(tick), fill="#888", font=("Segoe UI", 8))
-        c.create_text(self.x_at(-1.0), self.CH - self.PAD_B + 24, text="solar midnight",
+        # Anchor the edge labels to the canvas edges: centered text at the
+        # outermost gridlines would overflow the canvas and get clipped.
+        c.create_text(8, self.CH - self.PAD_B + 24, text="solar midnight", anchor="w",
                       fill="#666", font=("Segoe UI", 8))
         c.create_text(self.x_at(0.0), self.CH - self.PAD_B + 24, text="sunrise",
                       fill="#666", font=("Segoe UI", 8))
-        c.create_text(self.x_at(1.0), self.CH - self.PAD_B + 24, text="solar noon",
+        c.create_text(self.CW - 8, self.CH - self.PAD_B + 24, text="solar noon", anchor="e",
                       fill="#666", font=("Segoe UI", 8))
         for b in range(0, 101, 25):
             y = self.y_at(b)
