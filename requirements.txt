@@ -1,3 +1,5 @@
 astral
 pytz
 timezonefinder
+pystray
+Pillow

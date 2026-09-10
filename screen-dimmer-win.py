@@ -2,7 +2,11 @@ import ctypes
 import json
 import math
 import os
+import queue
+import threading
+import time
 import urllib.request
+from ctypes import wintypes
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 
@@ -12,6 +16,13 @@ from tkinter import messagebox, ttk
 from astral import Observer
 from astral.sun import elevation, sun
 from timezonefinder import TimezoneFinder
+
+try:
+    import pystray
+    from PIL import Image, ImageDraw
+    TRAY_AVAILABLE = True
+except ImportError:
+    TRAY_AVAILABLE = False
 
 # --- 1. WINDOWS API CONFIGURATION ---
 class RGB(ctypes.Structure):
@@ -61,7 +72,20 @@ class DEVMODE(ctypes.Structure):
 
 ENUM_CURRENT_SETTINGS = -1
 
-hdc = ctypes.windll.user32.GetDC(0)
+# Declare pointer-sized Win32 graphics handles explicitly. ctypes otherwise
+# assumes c_int arguments/results, which can truncate HDC values on 64-bit.
+user32 = ctypes.windll.user32
+gdi32 = ctypes.windll.gdi32
+user32.GetDC.argtypes = [wintypes.HWND]
+user32.GetDC.restype = wintypes.HANDLE
+user32.ReleaseDC.argtypes = [wintypes.HWND, wintypes.HANDLE]
+user32.ReleaseDC.restype = ctypes.c_int
+gdi32.GetDeviceGammaRamp.argtypes = [wintypes.HANDLE, ctypes.c_void_p]
+gdi32.GetDeviceGammaRamp.restype = wintypes.BOOL
+gdi32.SetDeviceGammaRamp.argtypes = [wintypes.HANDLE, ctypes.c_void_p]
+gdi32.SetDeviceGammaRamp.restype = wintypes.BOOL
+
+hdc = user32.GetDC(None)
 
 # Settings are persisted next to this script
 SETTINGS_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "settings.json")
@@ -74,16 +98,22 @@ DEFAULT_SETTINGS = {
     "auto_mode": "sun",     # "sun" = follow sunrise/sunset, "curve" = custom 24h curve
     "auto_curve": None,      # [[x, brightness%], ...] on the normalized day axis
     "auto_curve_floor": 0,   # minimum brightness % for the custom curve
+    "minimize_to_tray": True,
 }
 
 TRANSITION_MINUTES = 30  # fade length around sunrise/sunset
 
 # The last ramp WE wrote. The hardware LUT is global, volatile state: games,
-# the OS, and display mode changes can overwrite it at any time with no
-# notification. The watchdog (section 2b) detects that and re-applies this.
+# the OS, and display mode changes can overwrite it at any time. Windows has no
+# general gamma-change notification, so nearby system events trigger short,
+# fast verification bursts while the watchdog remains a fallback.
 current_ramp = None
+gamma_lock = threading.RLock()
 
 WATCHDOG_INTERVAL_MS = 2000
+# Extra checks after a foreground/display event. A reset can occur shortly
+# after the notification, so checking only once is not sufficient.
+EVENT_RECHECK_DELAYS_MS = (15, 35, 75, 150, 300, 600, 1200)
 # Tolerance in 16-bit LUT units to absorb driver quantization on read-back.
 # A genuine reset or foreign ramp differs by far more when dimming is active.
 RAMP_TOLERANCE = 1024
@@ -91,7 +121,8 @@ RAMP_TOLERANCE = 1024
 LOG_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "gamma_watchdog.log")
 
 def log_event(message):
-    line = f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] {message}"
+    timestamp = datetime.now().strftime('%Y-%m-%d %H:%M:%S.%f')[:-3]
+    line = f"[{timestamp}] {message}"
     try:
         with open(LOG_FILE, "a", encoding="utf-8") as f:
             f.write(line + "\n")
@@ -119,8 +150,9 @@ def apply_gamma(r_mult, g_mult, b_mult, brightness=1.0):
         ramp.green[i] = max(0, min(65535, int(base * brightness * g_mult)))
         ramp.blue[i] = max(0, min(65535, int(base * brightness * b_mult)))
 
-    current_ramp = ramp
-    ctypes.windll.gdi32.SetDeviceGammaRamp(hdc, ctypes.byref(ramp))
+    with gamma_lock:
+        current_ramp = ramp
+        ctypes.windll.gdi32.SetDeviceGammaRamp(hdc, ctypes.byref(ramp))
 
 # --- 2. WATCHDOG DIAGNOSTIC HELPERS ---
 def ramp_max_diff(a, b):
@@ -168,6 +200,275 @@ def fmt_mode(mode):
         return "unknown"
     w, h, freq = mode
     return f"{w}x{h} @{freq}Hz"
+
+
+def repair_gamma_if_needed(trigger):
+    """Immediately restore our ramp if a system event exposed an overwrite."""
+    with gamma_lock:
+        expected = current_ramp
+        if expected is None:
+            return False
+
+        # Use a DC obtained on this monitor thread instead of sharing the GUI
+        # thread's DC across threads.
+        event_hdc = user32.GetDC(None)
+        if not event_hdc:
+            return False
+        try:
+            actual = RGB()
+            if not gdi32.GetDeviceGammaRamp(event_hdc, ctypes.byref(actual)):
+                return False
+
+            diff = ramp_max_diff(expected, actual)
+            if diff <= RAMP_TOLERANCE:
+                return False
+
+            kind = ("LINEAR/default (reset)"
+                    if is_linear_ramp(actual)
+                    else "CUSTOM curve (another app/game wrote it)")
+            applied = bool(gdi32.SetDeviceGammaRamp(
+                event_hdc, ctypes.byref(expected)))
+            outcome = "Re-applied our ramp." if applied else "Re-apply FAILED."
+            log_event(
+                f"Event repair ({trigger}): max diff={diff}. Foreign ramp is {kind}. "
+                f"Samples: {ramp_samples(actual)}. {outcome}"
+            )
+            return applied
+        finally:
+            user32.ReleaseDC(None, event_hdc)
+
+
+class GammaEventMonitor:
+    """Listen for likely reset events and perform a short verification burst.
+
+    Win32 does not publish a general notification when the hardware gamma LUT
+    changes. Foreground and display/configuration messages are useful proxies.
+    Delayed one-shot checks cover drivers that reset the LUT just after sending
+    the corresponding notification.
+    """
+
+    WM_CLOSE = 0x0010
+    WM_DESTROY = 0x0002
+    WM_SETTINGCHANGE = 0x001A
+    WM_DISPLAYCHANGE = 0x007E
+    WM_TIMER = 0x0113
+    WM_DEVICECHANGE = 0x0219
+    EVENT_SYSTEM_FOREGROUND = 0x0003
+    WINEVENT_OUTOFCONTEXT = 0x0000
+
+    _LRESULT = ctypes.c_ssize_t
+    _WNDPROC = ctypes.WINFUNCTYPE(
+        _LRESULT, wintypes.HWND, wintypes.UINT, wintypes.WPARAM, wintypes.LPARAM)
+    _WINEVENTPROC = ctypes.WINFUNCTYPE(
+        None, wintypes.HANDLE, wintypes.DWORD, wintypes.HWND,
+        wintypes.LONG, wintypes.LONG, wintypes.DWORD, wintypes.DWORD)
+
+    class _WNDCLASSEXW(ctypes.Structure):
+        _fields_ = [
+            ("cbSize", wintypes.UINT),
+            ("style", wintypes.UINT),
+            ("lpfnWndProc", ctypes.c_void_p),
+            ("cbClsExtra", ctypes.c_int),
+            ("cbWndExtra", ctypes.c_int),
+            ("hInstance", wintypes.HINSTANCE),
+            ("hIcon", wintypes.HANDLE),
+            ("hCursor", wintypes.HANDLE),
+            ("hbrBackground", wintypes.HANDLE),
+            ("lpszMenuName", wintypes.LPCWSTR),
+            ("lpszClassName", wintypes.LPCWSTR),
+            ("hIconSm", wintypes.HANDLE),
+        ]
+
+    def __init__(self):
+        self._thread = None
+        self._thread_id = None
+        self._hwnd = None
+        self._hook = None
+        self._timers = {}
+        self._next_timer_id = 10
+        self._ready = threading.Event()
+        self._stop_requested = threading.Event()
+        self._wndproc_callback = self._WNDPROC(self._window_proc)
+        self._winevent_callback = self._WINEVENTPROC(self._win_event_proc)
+        self._class_name = f"ScreenDimmerGammaEvents-{os.getpid()}"
+
+    def start(self):
+        self._thread = threading.Thread(
+            target=self._message_loop, name="gamma-event-monitor", daemon=True)
+        self._thread.start()
+        self._ready.wait(2.0)
+        if self._hwnd:
+            hook_status = "active" if self._hook else "FAILED"
+            log_event(
+                "Gamma event monitor started (display/config events; "
+                f"foreground hook {hook_status}).")
+        else:
+            log_event("Gamma event monitor could not create its Win32 message window.")
+
+    def stop(self):
+        self._stop_requested.set()
+        thread = self._thread
+        hwnd = self._hwnd
+        posted = bool(hwnd and ctypes.windll.user32.PostMessageW(
+            hwnd, self.WM_CLOSE, 0, 0))
+        if (not posted and thread and thread.is_alive()
+                and self._thread_id is not None):
+            ctypes.windll.user32.PostThreadMessageW(
+                self._thread_id, 0x0012, 0, 0)  # WM_QUIT fallback
+        if thread and thread.is_alive():
+            thread.join(timeout=3.0)
+        stopped = not (thread and thread.is_alive())
+        if stopped:
+            self._thread = None
+        else:
+            log_event("Gamma event monitor did not stop within 3 seconds.")
+        return stopped
+
+    def _message_loop(self):
+        try:
+            self._message_loop_inner()
+        except Exception as exc:
+            log_event(f"Gamma event monitor thread failed: {exc}")
+            self._ready.set()
+        finally:
+            # Never leave a stale ID that a later stop() could signal after the
+            # OS has reused it for an unrelated thread.
+            self._thread_id = None
+
+    def _message_loop_inner(self):
+        user32 = ctypes.windll.user32
+        kernel32 = ctypes.windll.kernel32
+
+        user32.DefWindowProcW.argtypes = [
+            wintypes.HWND, wintypes.UINT, wintypes.WPARAM, wintypes.LPARAM]
+        user32.DefWindowProcW.restype = self._LRESULT
+        user32.CreateWindowExW.argtypes = [
+            wintypes.DWORD, wintypes.LPCWSTR, wintypes.LPCWSTR, wintypes.DWORD,
+            ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int,
+            wintypes.HWND, wintypes.HANDLE, wintypes.HINSTANCE, ctypes.c_void_p]
+        user32.CreateWindowExW.restype = wintypes.HWND
+        user32.SetWinEventHook.argtypes = [
+            wintypes.DWORD, wintypes.DWORD, wintypes.HMODULE,
+            self._WINEVENTPROC, wintypes.DWORD, wintypes.DWORD, wintypes.DWORD]
+        user32.SetWinEventHook.restype = wintypes.HANDLE
+        user32.UnhookWinEvent.argtypes = [wintypes.HANDLE]
+        user32.UnhookWinEvent.restype = wintypes.BOOL
+        user32.RegisterClassExW.argtypes = [ctypes.POINTER(self._WNDCLASSEXW)]
+        user32.RegisterClassExW.restype = wintypes.ATOM
+        user32.UnregisterClassW.argtypes = [wintypes.LPCWSTR, wintypes.HINSTANCE]
+        user32.UnregisterClassW.restype = wintypes.BOOL
+        user32.DestroyWindow.argtypes = [wintypes.HWND]
+        user32.DestroyWindow.restype = wintypes.BOOL
+        user32.PostMessageW.argtypes = [
+            wintypes.HWND, wintypes.UINT, wintypes.WPARAM, wintypes.LPARAM]
+        user32.PostMessageW.restype = wintypes.BOOL
+        user32.PostThreadMessageW.argtypes = [
+            wintypes.DWORD, wintypes.UINT, wintypes.WPARAM, wintypes.LPARAM]
+        user32.PostThreadMessageW.restype = wintypes.BOOL
+        user32.SetTimer.argtypes = [
+            wintypes.HWND, ctypes.c_size_t, wintypes.UINT, ctypes.c_void_p]
+        user32.SetTimer.restype = ctypes.c_size_t
+        user32.KillTimer.argtypes = [wintypes.HWND, ctypes.c_size_t]
+        user32.KillTimer.restype = wintypes.BOOL
+        kernel32.GetModuleHandleW.argtypes = [wintypes.LPCWSTR]
+        kernel32.GetModuleHandleW.restype = wintypes.HMODULE
+        kernel32.GetCurrentThreadId.restype = wintypes.DWORD
+
+        self._thread_id = kernel32.GetCurrentThreadId()
+        instance = kernel32.GetModuleHandleW(None)
+        wc = self._WNDCLASSEXW()
+        wc.cbSize = ctypes.sizeof(wc)
+        wc.lpfnWndProc = ctypes.cast(self._wndproc_callback, ctypes.c_void_p).value
+        wc.hInstance = instance
+        wc.lpszClassName = self._class_name
+
+        if not user32.RegisterClassExW(ctypes.byref(wc)):
+            self._ready.set()
+            return
+
+        hwnd = user32.CreateWindowExW(
+            0, self._class_name, self._class_name, 0,
+            0, 0, 0, 0, None, None, instance, None)
+        self._hwnd = hwnd
+        if hwnd:
+            self._hook = user32.SetWinEventHook(
+                self.EVENT_SYSTEM_FOREGROUND, self.EVENT_SYSTEM_FOREGROUND,
+                None, self._winevent_callback, 0, 0, self.WINEVENT_OUTOFCONTEXT)
+        self._ready.set()
+
+        if not hwnd:
+            user32.UnregisterClassW(self._class_name, instance)
+            return
+        if self._stop_requested.is_set():
+            user32.PostMessageW(hwnd, self.WM_CLOSE, 0, 0)
+
+        msg = wintypes.MSG()
+        while user32.GetMessageW(ctypes.byref(msg), None, 0, 0) > 0:
+            user32.TranslateMessage(ctypes.byref(msg))
+            user32.DispatchMessageW(ctypes.byref(msg))
+
+        if self._hook:
+            user32.UnhookWinEvent(self._hook)
+            self._hook = None
+        self._hwnd = None
+        self._thread_id = None
+        user32.UnregisterClassW(self._class_name, instance)
+
+    def _win_event_proc(self, hook, event, hwnd, object_id, child_id,
+                        event_thread, event_time):
+        try:
+            self._trigger_checks("foreground change")
+        except Exception as exc:
+            log_event(f"Foreground gamma event handler failed: {exc}")
+
+    def _trigger_checks(self, reason):
+        if self._stop_requested.is_set():
+            return
+        # Check now, then at sparse intervals while a mode transition settles.
+        repair_gamma_if_needed(reason)
+        user32 = ctypes.windll.user32
+        for timer_id in tuple(self._timers):
+            user32.KillTimer(self._hwnd, timer_id)
+        self._timers.clear()
+        for delay in EVENT_RECHECK_DELAYS_MS:
+            # Never reuse an ID: KillTimer does not remove WM_TIMER messages
+            # already queued for an earlier burst.
+            timer_id = self._next_timer_id
+            self._next_timer_id += 1
+            if user32.SetTimer(self._hwnd, timer_id, delay, None):
+                self._timers[timer_id] = (reason, delay)
+
+    def _window_proc(self, hwnd, message, wparam, lparam):
+        try:
+            if message == self.WM_TIMER:
+                timer_id = int(wparam)
+                scheduled = self._timers.pop(timer_id, None)
+                ctypes.windll.user32.KillTimer(hwnd, timer_id)
+                if scheduled and not self._stop_requested.is_set():
+                    reason, delay = scheduled
+                    repair_gamma_if_needed(f"{reason} +{delay}ms")
+                return 0
+            if message == self.WM_DISPLAYCHANGE:
+                self._trigger_checks("display change")
+                return 0
+            if message == self.WM_SETTINGCHANGE:
+                self._trigger_checks("system setting change")
+                return 0
+            if message == self.WM_DEVICECHANGE:
+                self._trigger_checks("display device change")
+                # Preserve DefWindowProc's response to removal-query messages.
+                return ctypes.windll.user32.DefWindowProcW(
+                    hwnd, message, wparam, lparam)
+            if message == self.WM_CLOSE:
+                ctypes.windll.user32.DestroyWindow(hwnd)
+                return 0
+            if message == self.WM_DESTROY:
+                ctypes.windll.user32.PostQuitMessage(0)
+                return 0
+        except Exception as exc:
+            log_event(f"Gamma event monitor failed for message {message:#x}: {exc}")
+        return ctypes.windll.user32.DefWindowProcW(hwnd, message, wparam, lparam)
+
 
 # --- 3. HELPER FUNCTIONS ---
 def kelvin_to_rgb(kelvin):
@@ -667,8 +968,15 @@ class SunsetApp(tk.Tk):
         # Prevent screen from staying tinted if the app is closed
         self.protocol("WM_DELETE_WINDOW", self.on_close)
 
+        # Minimize-to-tray support
+        self._closing = False
+        self._tray_icon = None
+        self._tray_queue = queue.Queue()
+
         # Load saved preferences (zip code, location, auto-brightness)
         self.settings = self.load_settings()
+        self.minimize_to_tray_var = tk.BooleanVar(
+            value=bool(self.settings.get("minimize_to_tray", True)))
         loc = self.settings.get("location") or {}
         self.lat = loc.get("lat")
         self.lon = loc.get("lon")
@@ -682,6 +990,7 @@ class SunsetApp(tk.Tk):
         self.auto_brightness = 1.0
 
         self._watchdog_job = None
+        self._gamma_event_monitor = GammaEventMonitor()
         self.last_mode = get_display_mode()
         log_event(f"App started. Display mode: {fmt_mode(self.last_mode)}")
 
@@ -697,6 +1006,13 @@ class SunsetApp(tk.Tk):
         self.after(60_000, self.auto_tick)
 
         self.start_watchdog()
+        self._gamma_event_monitor.start()
+
+        # Hide to tray when minimized, and start the tray icon if requested
+        self.bind("<Unmap>", self._on_unmap)
+        if TRAY_AVAILABLE and self.minimize_to_tray_var.get():
+            self.start_tray()
+        self.after(100, self._poll_tray_events)
 
     def create_widgets(self):
         # --- Live status header ---
@@ -872,6 +1188,18 @@ class SunsetApp(tk.Tk):
         tk.Radiobutton(mode_frame, text="RGB channels", variable=self.mode_var,
                        value="rgb", command=self.toggle_modes).pack(anchor="w")
 
+        tray_frame = tk.LabelFrame(dlg, text="System Tray", padx=10, pady=8)
+        tray_frame.pack(padx=10, pady=(5, 5), fill="x")
+        tray_cb = tk.Checkbutton(
+            tray_frame,
+            text="Minimize to system tray" + ("" if TRAY_AVAILABLE else " (pystray not installed)"),
+            variable=self.minimize_to_tray_var,
+            command=self.on_tray_setting_change,
+        )
+        if not TRAY_AVAILABLE:
+            tray_cb.config(state="disabled")
+        tray_cb.pack(anchor="w")
+
         tk.Button(dlg, text="Reset Screen to Normal", bg="lightgray",
                   command=self.reset_screen).pack(padx=10, pady=(5, 10), fill="x")
 
@@ -903,6 +1231,7 @@ class SunsetApp(tk.Tk):
             "night_brightness": self.night_slider.get(),
             "auto_mode": self.auto_mode_var.get(),
             "auto_curve": self.settings.get("auto_curve"),
+            "minimize_to_tray": bool(self.minimize_to_tray_var.get()),
         })
         try:
             with open(SETTINGS_FILE, "w", encoding="utf-8") as f:
@@ -1133,6 +1462,130 @@ class SunsetApp(tk.Tk):
 
         self.refresh_header()
 
+    # --- System tray (minimize to tray) ---
+    def _on_unmap(self, event):
+        """Intercept an iconify (minimize) and hide the window instead."""
+        if self._closing:
+            return
+        if (TRAY_AVAILABLE and self.minimize_to_tray_var.get()
+                and self.state() == "iconic"):
+            self.after_idle(self._minimize_to_tray)
+
+    def _minimize_to_tray(self):
+        if self._closing or self.state() != "iconic":
+            return
+        self.withdraw()
+        if self._tray_icon is not None:
+            try:
+                self._tray_icon.title = "Custom Sunset Screen — click to restore"
+            except Exception:
+                pass
+
+    def restore_from_tray(self):
+        if self._closing:
+            return
+        self.deiconify()
+        try:
+            self.state("normal")
+        except Exception:
+            pass
+        self.lift()
+        self.focus_force()
+        if self._tray_icon is not None:
+            try:
+                self._tray_icon.title = "Custom Sunset Screen"
+            except Exception:
+                pass
+
+    def _tray_show(self, icon, item):
+        self._tray_queue.put("restore")
+
+    def _tray_exit(self, icon, item):
+        self._tray_queue.put("exit")
+
+    def _poll_tray_events(self):
+        try:
+            while True:
+                action = self._tray_queue.get_nowait()
+                if action == "restore":
+                    self.restore_from_tray()
+                elif action == "exit":
+                    self.on_close()
+                    return
+        except queue.Empty:
+            pass
+        if not self._closing:
+            self.after(100, self._poll_tray_events)
+
+    def _create_tray_image(self):
+        """Draw a small sunset icon for the tray."""
+        image = Image.new("RGBA", (64, 64), (0, 0, 0, 0))
+        draw = ImageDraw.Draw(image)
+        # Sun disc
+        draw.ellipse((16, 18, 48, 50), fill=(255, 170, 50, 255),
+                     outline=(175, 95, 0, 255), width=3)
+        # Rays
+        for x0, y0, x1, y1 in ((32, 2, 32, 8), (32, 56, 32, 62),
+                               (2, 34, 8, 34), (56, 34, 62, 34),
+                               (11, 11, 15, 15), (49, 53, 53, 57),
+                               (53, 11, 49, 15), (11, 57, 15, 53)):
+            draw.line((x0, y0, x1, y1), fill=(255, 170, 50, 255), width=4)
+        return image
+
+    def start_tray(self):
+        """Create and show the tray icon (if not already running)."""
+        if not TRAY_AVAILABLE or self._tray_icon is not None:
+            return
+        try:
+            menu = pystray.Menu(
+                pystray.MenuItem("Show App", self._tray_show, default=True),
+                pystray.MenuItem("Exit", self._tray_exit),
+            )
+            self._tray_icon = pystray.Icon(
+                "Custom Sunset Screen",
+                self._create_tray_image(),
+                "Custom Sunset Screen",
+                menu,
+            )
+            self._tray_icon.run_detached()
+            # Wait until pystray's message window exists before returning.
+            # Calling stop() before _run() marks the icon as ready is a no-op,
+            # which would leave the icon thread running.
+            if not self._wait_for_tray_ready(self._tray_icon, 3.0):
+                log_event("Tray icon did not become ready within 3 seconds")
+        except Exception as exc:
+            log_event(f"Could not start tray icon: {exc}")
+            self._tray_icon = None
+
+    def _wait_for_tray_ready(self, icon, timeout):
+        """Wait briefly for a pystray icon to finish starting up."""
+        deadline = time.monotonic() + timeout
+        while not getattr(icon, "_running", False) and time.monotonic() < deadline:
+            time.sleep(0.01)
+        return bool(getattr(icon, "_running", False))
+
+    def stop_tray(self):
+        """Stop and remove the tray icon."""
+        if self._tray_icon is None:
+            return
+        icon, self._tray_icon = self._tray_icon, None
+        # pystray's stop() only works once the icon is running. It normally is
+        # by now, but wait a moment if it was just started.
+        if not getattr(icon, "_running", False):
+            self._wait_for_tray_ready(icon, 3.0)
+        try:
+            icon.stop()
+        except Exception:
+            pass
+
+    def on_tray_setting_change(self):
+        self.save_settings()
+        if self.minimize_to_tray_var.get():
+            self.start_tray()
+        else:
+            self.restore_from_tray()
+            self.stop_tray()
+
     # --- Gamma watchdog: detect & repair external resets/overwrites ---
     def start_watchdog(self):
         self._watchdog_job = self.after(WATCHDOG_INTERVAL_MS, self.gamma_watchdog)
@@ -1149,31 +1602,36 @@ class SunsetApp(tk.Tk):
           is installed but being bypassed (HDR / exclusive flip path), and
           re-applying cannot fix that
         """
-        if current_ramp is not None:
-            actual = RGB()
-            if ctypes.windll.gdi32.GetDeviceGammaRamp(hdc, ctypes.byref(actual)):
-                diff = ramp_max_diff(current_ramp, actual)
-                mode_now = get_display_mode()
-                mode_changed = mode_now != self.last_mode
-                self.last_mode = mode_now
+        with gamma_lock:
+            expected = current_ramp
+            if expected is not None:
+                actual = RGB()
+                if ctypes.windll.gdi32.GetDeviceGammaRamp(hdc, ctypes.byref(actual)):
+                    diff = ramp_max_diff(expected, actual)
+                    mode_now = get_display_mode()
+                    mode_changed = mode_now != self.last_mode
+                    self.last_mode = mode_now
 
-                if diff > RAMP_TOLERANCE:
-                    kind = ("LINEAR/default (reset)"
-                            if is_linear_ramp(actual)
-                            else "CUSTOM curve (another app/game wrote it)")
-                    log_event(
-                        f"Ramp overwritten! max diff={diff}. Foreign ramp is {kind}. "
-                        f"Samples: {ramp_samples(actual)}. "
-                        f"Display mode {fmt_mode(mode_now)}"
-                        f"{' [CHANGED in last 2s]' if mode_changed else ' [unchanged]'}. "
-                        f"Re-applied our ramp."
-                    )
-                    ctypes.windll.gdi32.SetDeviceGammaRamp(hdc, ctypes.byref(current_ramp))
-                elif mode_changed:
-                    log_event(
-                        f"Display mode changed to {fmt_mode(mode_now)} "
-                        f"but our ramp is intact (diff={diff})."
-                    )
+                    if diff > RAMP_TOLERANCE:
+                        kind = ("LINEAR/default (reset)"
+                                if is_linear_ramp(actual)
+                                else "CUSTOM curve (another app/game wrote it)")
+                        applied = bool(gdi32.SetDeviceGammaRamp(
+                            hdc, ctypes.byref(expected)))
+                        outcome = ("Re-applied our ramp."
+                                   if applied else "Re-apply FAILED.")
+                        log_event(
+                            f"Ramp overwritten! max diff={diff}. Foreign ramp is {kind}. "
+                            f"Samples: {ramp_samples(actual)}. "
+                            f"Display mode {fmt_mode(mode_now)}"
+                            f"{' [CHANGED in last 2s]' if mode_changed else ' [unchanged]'}. "
+                            f"{outcome}"
+                        )
+                    elif mode_changed:
+                        log_event(
+                            f"Display mode changed to {fmt_mode(mode_now)} "
+                            f"but our ramp is intact (diff={diff})."
+                        )
         self._watchdog_job = self.after(WATCHDOG_INTERVAL_MS, self.gamma_watchdog)
 
     def reset_screen(self):
@@ -1187,17 +1645,34 @@ class SunsetApp(tk.Tk):
         apply_gamma(1.0, 1.0, 1.0, 1.0)
 
     def on_close(self):
+        global current_ramp
+        if self._closing:
+            return
+        self._closing = True
+
         if self._watchdog_job is not None:
             try:
                 self.after_cancel(self._watchdog_job)
             except Exception:
                 pass
             self._watchdog_job = None
-        log_event("App closing; ramp reset to normal.")
+
+        # Stop event-driven repairs before deliberately restoring identity.
+        event_monitor_stopped = self._gamma_event_monitor.stop()
+        self.stop_tray()
+        log_event("App closing.")
         # Persist preferences, then reset screen to normal before closing
         self.save_settings()
-        apply_gamma(1.0, 1.0, 1.0, 1.0)
-        ctypes.windll.user32.ReleaseDC(0, hdc)
+        if event_monitor_stopped:
+            apply_gamma(1.0, 1.0, 1.0, 1.0)
+            log_event("Ramp reset to normal.")
+            user32.ReleaseDC(None, hdc)
+        else:
+            # Do not wait forever on gamma_lock if the driver call holding it
+            # is exactly why the monitor could not stop. Process teardown will
+            # reclaim the DC; suppress any new repair attempts meanwhile.
+            current_ramp = None
+            log_event("Skipped shutdown ramp reset because gamma driver call is stuck.")
         self.destroy()
 
 if __name__ == "__main__":
