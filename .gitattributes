@@ -1,0 +1,9 @@
+# Normalize line endings: store LF in the repository, check out native endings.
+* text=auto
+
+# Never touch binary files.
+*.png binary
+*.jpg binary
+*.jpeg binary
+*.ico binary
+*.exe binary
