@@ -68,8 +68,8 @@ brightness, and whether auto is on.
 | Control | What it does |
 |---|---|
 | **Color Temp (Kelvin)** | Warmer as you slide left; 6500 K is a no-op. |
-| **Brightness (%)** | Manual dimming. Disabled while auto brightness is on. |
-| **Auto-adjust by time of day** | Enables the schedule; the sub-controls appear underneath. |
+| **Brightness (%)** | Manual dimming. Hidden while auto brightness is on, so nothing on screen contradicts the level in use. |
+| **Auto-adjust by time of day** | Enables the schedule; the sub-controls appear underneath and auto takes over the brightness level. |
 | **Night Brightness** | Floor level for the sunrise/sunset schedule. |
 | **Edit Curve…** | Opens the curve editor (custom-curve mode only). |
 | **Advanced…** | Colour mode switch, minimize-to-tray toggle, and *Reset Screen to Normal*. |

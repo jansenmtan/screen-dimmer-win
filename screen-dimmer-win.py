@@ -1036,7 +1036,8 @@ class SunsetApp(tk.Tk):
         self.temp_slider.set(6500)
         self.temp_slider.pack(fill="x")
 
-        tk.Label(self.temp_frame, text="Brightness (%)").pack(pady=(10,0))
+        self.bright_label = tk.Label(self.temp_frame, text="Brightness (%)")
+        self.bright_label.pack(pady=(10,0))
         self.bright_slider = tk.Scale(self.temp_frame, from_=5, to=100, orient="horizontal", command=lambda e: self.update_screen())
         self.bright_slider.set(100)
         self.bright_slider.pack(fill="x")
@@ -1361,13 +1362,32 @@ class SunsetApp(tk.Tk):
         if self.auto_var.get():
             self.run_auto_now()
 
+    def set_manual_brightness_visible(self, visible):
+        """Show or hide the manual brightness row (label + slider).
+
+        Idempotent: re-packing a packed widget just re-applies its options,
+        and pack_forget on an unmapped widget does nothing, so callers do not
+        need to track the current state.
+        """
+        if visible:
+            self.bright_label.pack(pady=(10, 0))
+            self.bright_slider.pack(fill="x")
+            self.temp_frame.config(text="Temperature & Brightness")
+        else:
+            self.bright_label.pack_forget()
+            self.bright_slider.pack_forget()
+            # The frame now holds temperature only; keep the title honest.
+            self.temp_frame.config(text="Color Temperature")
+
     def apply_auto_state(self):
-        """Enable/disable manual brightness control based on the auto checkbox."""
+        """Auto brightness owns the level, so the manual slider only exists
+        while auto is off. Leaving it visible but disabled showed a stale 100%
+        next to a header reporting the auto value."""
         if self.auto_var.get():
-            self.bright_slider.config(state="disabled")
+            self.set_manual_brightness_visible(False)
             self.run_auto_now()
         else:
-            self.bright_slider.config(state="normal")
+            self.set_manual_brightness_visible(True)
             self.auto_brightness = 1.0
             self.auto_status.config(text="")
             self.update_screen()
