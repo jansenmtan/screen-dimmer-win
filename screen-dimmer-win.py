@@ -87,6 +87,9 @@ gdi32.SetDeviceGammaRamp.restype = wintypes.BOOL
 
 hdc = user32.GetDC(None)
 
+# Display name used for the window title and the tray icon.
+APP_NAME = "screen-dimmer-win"
+
 # Settings are persisted next to this script
 SETTINGS_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "settings.json")
 
@@ -962,7 +965,7 @@ class CurveEditor(tk.Toplevel):
 class SunsetApp(tk.Tk):
     def __init__(self):
         super().__init__()
-        self.title("Custom Sunset Screen")
+        self.title(APP_NAME)
         self.resizable(False, False)
 
         # Prevent screen from staying tinted if the app is closed
@@ -1477,7 +1480,7 @@ class SunsetApp(tk.Tk):
         self.withdraw()
         if self._tray_icon is not None:
             try:
-                self._tray_icon.title = "Custom Sunset Screen — click to restore"
+                self._tray_icon.title = f"{APP_NAME} — click to restore"
             except Exception:
                 pass
 
@@ -1493,7 +1496,7 @@ class SunsetApp(tk.Tk):
         self.focus_force()
         if self._tray_icon is not None:
             try:
-                self._tray_icon.title = "Custom Sunset Screen"
+                self._tray_icon.title = APP_NAME
             except Exception:
                 pass
 
@@ -1542,9 +1545,9 @@ class SunsetApp(tk.Tk):
                 pystray.MenuItem("Exit", self._tray_exit),
             )
             self._tray_icon = pystray.Icon(
-                "Custom Sunset Screen",
+                APP_NAME,
                 self._create_tray_image(),
-                "Custom Sunset Screen",
+                APP_NAME,
                 menu,
             )
             self._tray_icon.run_detached()
